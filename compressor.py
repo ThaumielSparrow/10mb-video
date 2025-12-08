@@ -1,7 +1,6 @@
 import os
 import subprocess
 import re
-import signal
 from utils import get_video_metadata
 
 OUTPUT_DIR = "outputs"
@@ -13,7 +12,7 @@ class VideoCompressor:
 
     def compress(self, input_path, target_mb, remove_audio, start_time, end_time, use_h265, progress_callback):
         
-        # Analyze Video
+        # 1. Analyze Video
         progress_callback(0, desc="Analyzing Metadata...")
         meta = get_video_metadata(input_path)
         
@@ -33,12 +32,21 @@ class VideoCompressor:
 
         is_trimmed = (s_time > 0 or e_time < meta["duration"])
 
-        target_bytes = target_mb * 1024 * 1024
-        if (meta["size_bytes"] < target_bytes) and not is_trimmed and not remove_audio and not use_h265:
+        target_bytes_strict = target_mb * 1024 * 1024
+        if (meta["size_bytes"] < target_bytes_strict) and not is_trimmed and not remove_audio and not use_h265:
             print("File is already below target size. Skipping encoding.")
             return input_path
 
-        # Calculate Target Bitrate
+        # Reserve space for MP4 container overhead
+        if target_mb <= 20:
+            safety_buffer = 0.90 
+        else:
+            safety_buffer = 0.95
+
+        effective_target_bytes = target_bytes_strict * safety_buffer
+        total_bits_allowed = effective_target_bytes * 8
+        
+        # Calculate Audio Bitrate
         audio_bitrate = 128 * 1024 # Standard 128k
         should_process_audio = meta["has_audio"] and not remove_audio
 
@@ -46,18 +54,24 @@ class VideoCompressor:
             audio_bitrate = 0
             audio_args = ["-an"]
         else:
-            total_available_bits = target_bytes * 8
-            naive_video_bitrate = (total_available_bits / target_duration) - audio_bitrate
+            # Check if video bitrate would be too low
+            naive_video_bitrate = (total_bits_allowed / target_duration) - audio_bitrate
+            
+            # If video allows < 200kbps, drop audio to 64k to save space
             if naive_video_bitrate < (200 * 1024):
                 audio_bitrate = 64 * 1024 
+            
             audio_args = ["-c:a", "aac", "-b:a", str(int(audio_bitrate))]
 
-        total_bits_allowed = target_bytes * 8
+        # Calculate Video Bitrate
         target_total_bitrate = total_bits_allowed / target_duration
         video_bitrate = target_total_bitrate - audio_bitrate
 
+        # Don't upscale bitrate if the source is already lower quality
         if video_bitrate > meta["bitrate"]:
-            video_bitrate = meta["bitrate"] * 0.95
+            video_bitrate = meta["bitrate"]
+
+        # Safety floor (10kbps minimum to prevent FFmpeg errors)
         if video_bitrate < 10000:
             video_bitrate = 10000
 
@@ -69,28 +83,33 @@ class VideoCompressor:
 
         trim_args = ["-ss", str(s_time), "-to", str(e_time)] if is_trimmed else []
 
-        # Codec Selection
         if use_h265:
-            codec_args = ["-c:v", "libx265", "-tag:v", "hvc1"] # hvc1 tag helps Apple compatibility
+            codec_args = ["-c:v", "libx265", "-tag:v", "hvc1"]
         else:
             codec_args = ["-c:v", "libx264"]
+
+        # Helper to stringify bitrate
+        v_bitrate_str = str(int(video_bitrate))
 
         common_args = [
             "-y",
             *trim_args,
             *codec_args,
             "-preset", "medium",
-            "-b:v", str(int(video_bitrate)),
+            "-b:v", v_bitrate_str,
+            # Constrain bitrate to prevent massive spikes that overshoot size
+            "-maxrate", str(int(video_bitrate * 1.5)),
+            "-bufsize", str(int(video_bitrate * 2)), 
             "-passlogfile", pass_log_prefix
         ]
 
-        # PASS 1 (Analysis) - Weights 0% -> 25% of progress bar
+        # PASS 1 (Analysis)
         cmd_pass1 = [
             "ffmpeg", "-i", input_path,
             *common_args,
             "-pass", "1",
             "-an", 
-            "-f", "mp4", "/dev/null"
+            "-f", "mp4", os.devnull # Windows-safe null output
         ]
         
         self._run_ffmpeg_with_progress(
@@ -99,10 +118,10 @@ class VideoCompressor:
             target_duration, 
             progress_start=0.0, 
             progress_end=0.25, 
-            description="Encoding Pass 1/2 (Analysis)"
+            description="Analyzing metadata..."
         )
 
-        # PASS 2 (Encoding) - Weights 25% -> 100% of progress bar
+        # PASS 2 (Encoding)
         cmd_pass2 = [
             "ffmpeg", "-i", input_path,
             *common_args,
@@ -117,17 +136,13 @@ class VideoCompressor:
             target_duration, 
             progress_start=0.25, 
             progress_end=1.0, 
-            description="Encoding Pass 2/2 (Compression)"
+            description="Compressing..."
         )
 
         self._cleanup_logs(pass_log_prefix)
         return output_path
 
     def _run_ffmpeg_with_progress(self, cmd, progress_callback, total_duration, progress_start, progress_end, description):
-        """
-        Runs FFmpeg and parses stderr for 'time=...' to update Gradio progress.
-        """
-        # Start subprocess, capturing stderr where FFmpeg writes stats
         process = subprocess.Popen(
             cmd, 
             stdout=subprocess.PIPE, 
@@ -135,27 +150,26 @@ class VideoCompressor:
             universal_newlines=True
         )
 
-        # Regex to match "time=00:00:00.00"
+        stderr_buffer = []
         time_pattern = re.compile(r"time=(\d{2}):(\d{2}):(\d{2}\.\d+)")
 
-        # Read line by line
         for line in process.stderr: # type:ignore
+            stderr_buffer.append(line)
+            if len(stderr_buffer) > 50:
+                stderr_buffer.pop(0)
+
             match = time_pattern.search(line)
             if match:
                 hours, minutes, seconds = map(float, match.groups())
                 current_time = hours * 3600 + minutes * 60 + seconds
-                
-                # Calculate percentage of THIS pass
                 fraction_complete = min(current_time / total_duration, 1.0)
-                
-                # Map to global progress bar
                 global_progress = progress_start + (fraction_complete * (progress_end - progress_start))
-                
                 progress_callback(global_progress, desc=f"{description}")
 
         process.wait()
         if process.returncode != 0:
-            raise Exception("FFmpeg encountered an error.")
+            error_log = "".join(stderr_buffer)
+            raise Exception(f"FFmpeg Error (Exit Code {process.returncode}):\n{error_log}")
 
     def _cleanup_logs(self, prefix):
         try:

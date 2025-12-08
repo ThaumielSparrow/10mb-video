@@ -28,8 +28,19 @@ def processing_function(video_file, target_size_type, custom_size_mb, remove_aud
     except Exception as e:
         raise gr.Error(f"Compression failed: {str(e)}")
 
+# Custom CSS injection as HTML to hide Gradio stopwatch on progress UI
+progress_css_html = """
+<style>
+.status-tracker .eta { display: none !important; }
+.status-tracker .time { display: none !important; }
+.progress-level .time { display: none !important; }
+.meta-text { display: none !important; } 
+</style>
+"""
+
 # UI Layout
 with gr.Blocks(title="Smart Video Compressor") as demo:
+    gr.HTML(progress_css_html)
     gr.Markdown("# 📼 Smart Video Compressor")
     gr.Markdown("Compress videos to a specific size, inspired by 8mb.video.")
     
