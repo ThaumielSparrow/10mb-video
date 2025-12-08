@@ -4,7 +4,7 @@ from compressor import VideoCompressor
 # Initialize Logic
 compressor = VideoCompressor()
 
-def processing_function(video_file, target_size_type, custom_size_mb, remove_audio, start_time, end_time, progress=gr.Progress()):
+def processing_function(video_file, target_size_type, custom_size_mb, remove_audio, use_h265, start_time, end_time, progress=gr.Progress()):
     if video_file is None:
         return None
 
@@ -21,16 +21,17 @@ def processing_function(video_file, target_size_type, custom_size_mb, remove_aud
             remove_audio=remove_audio,
             start_time=start_time,
             end_time=end_time,
+            use_h265=use_h265,
             progress_callback=progress
         )
         return output_path
     except Exception as e:
         raise gr.Error(f"Compression failed: {str(e)}")
 
-# --- UI Layout ---
+# UI Layout
 with gr.Blocks(title="Smart Video Compressor") as demo:
     gr.Markdown("# 📼 Smart Video Compressor")
-    gr.Markdown("Compress videos to a specific size. Inspired by 8mb.video.")
+    gr.Markdown("Compress videos to a specific size, inspired by 8mb.video.")
     
     with gr.Row():
         with gr.Column():
@@ -38,8 +39,8 @@ with gr.Blocks(title="Smart Video Compressor") as demo:
             
             with gr.Group():
                 target_size = gr.Dropdown(
-                    choices=["8 MB", "10 MB", "25 MB", "50 MB", "Custom"], 
-                    value="8 MB", 
+                    choices=["8MB", "10MB", "25MB", "50MB", "Custom"], 
+                    value="8MB", 
                     label="Target File Size",
                     filterable=False,
                     allow_custom_value=False
@@ -50,7 +51,12 @@ with gr.Blocks(title="Smart Video Compressor") as demo:
                     visible=False
                 )
             
-            remove_audio = gr.Checkbox(label="Remove Audio", value=False)
+            with gr.Row():
+                remove_audio = gr.Checkbox(label="Remove Audio", value=False)
+                use_h265 = gr.Checkbox(
+                    label="Use H.265 (HEVC)", 
+                    value=False
+                )
             
             with gr.Accordion("Trimming Options", open=False):
                 with gr.Row():
@@ -71,7 +77,8 @@ with gr.Blocks(title="Smart Video Compressor") as demo:
 
     btn.click(
         fn=processing_function,
-        inputs=[video_input, target_size, custom_size, remove_audio, start_t, end_t],
+        # Updated inputs list
+        inputs=[video_input, target_size, custom_size, remove_audio, use_h265, start_t, end_t],
         outputs=video_output
     )
 
