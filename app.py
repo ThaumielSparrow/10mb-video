@@ -39,8 +39,8 @@ with gr.Blocks(title="Smart Video Compressor") as demo:
             
             with gr.Group():
                 target_size = gr.Dropdown(
-                    choices=["8MB", "10MB", "25MB", "50MB", "Custom"], 
-                    value="8MB", 
+                    choices=["8 MB", "10 MB", "25 MB", "50 MB", "Custom"], 
+                    value="8 MB", 
                     label="Target File Size",
                     filterable=False,
                     allow_custom_value=False
@@ -77,7 +77,6 @@ with gr.Blocks(title="Smart Video Compressor") as demo:
 
     btn.click(
         fn=processing_function,
-        # Updated inputs list
         inputs=[video_input, target_size, custom_size, remove_audio, use_h265, start_t, end_t],
         outputs=video_output
     )
