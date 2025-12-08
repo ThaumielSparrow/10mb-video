@@ -10,7 +10,7 @@ class VideoCompressor:
     def __init__(self, output_dir=OUTPUT_DIR):
         self.output_dir = output_dir
 
-    def compress(self, input_path, target_mb, remove_audio, start_time, end_time, use_h265, progress_callback):
+    def compress(self, input_path, target_mb, remove_audio, start_time, end_time, progress_callback):
         
         # 1. Analyze Video
         progress_callback(0, desc="Analyzing Metadata...")
@@ -33,7 +33,7 @@ class VideoCompressor:
         is_trimmed = (s_time > 0 or e_time < meta["duration"])
 
         target_bytes_strict = target_mb * 1024 * 1024
-        if (meta["size_bytes"] < target_bytes_strict) and not is_trimmed and not remove_audio and not use_h265:
+        if (meta["size_bytes"] < target_bytes_strict) and not is_trimmed and not remove_audio:
             print("File is already below target size. Skipping encoding.")
             return input_path
 
@@ -83,10 +83,7 @@ class VideoCompressor:
 
         trim_args = ["-ss", str(s_time), "-to", str(e_time)] if is_trimmed else []
 
-        if use_h265:
-            codec_args = ["-c:v", "libx265", "-tag:v", "hvc1"]
-        else:
-            codec_args = ["-c:v", "libx264"]
+        codec_args = ["-c:v", "libx264"]
 
         # Helper to stringify bitrate
         v_bitrate_str = str(int(video_bitrate))
