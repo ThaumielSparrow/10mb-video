@@ -11,6 +11,6 @@ COPY app.py .
 
 RUN mkdir -p outputs
 
-EXPOSE 7680
+EXPOSE 7860
 
 CMD [ "python", "app.py" ]
