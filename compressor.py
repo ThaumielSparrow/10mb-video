@@ -1,7 +1,7 @@
 import os
 import subprocess
 import re
-from utils import get_video_metadata
+from utils import get_video_metadata, get_trim_bitrate
 
 OUTPUT_DIR = "outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -36,6 +36,15 @@ class VideoCompressor:
         if (meta["size_bytes"] < target_bytes_strict) and not is_trimmed and not remove_audio:
             print("File is already below target size. Skipping encoding.")
             return input_path
+        
+        source_bitrate_cap = meta["bitrate"]
+
+        if is_trimmed:
+            progress_callback(0, desc="Analyzing trimmed section...")
+            trim_bitrate = get_trim_bitrate(input_path, s_time, e_time, self.output_dir)
+            if trim_bitrate:
+                source_bitrate_cap = trim_bitrate
+                print(f"Trim detected. Using local bitrate cap: {int(trim_bitrate/1024)}k (Global was {int(meta['bitrate']/1024)}k)")
 
         # Reserve space for MP4 container overhead
         if target_mb <= 20:
@@ -68,8 +77,8 @@ class VideoCompressor:
         video_bitrate = target_total_bitrate - audio_bitrate
 
         # Don't upscale bitrate if the source is already lower quality
-        if video_bitrate > meta["bitrate"]:
-            video_bitrate = meta["bitrate"]
+        if video_bitrate > source_bitrate_cap:
+            video_bitrate = source_bitrate_cap
 
         # Safety floor (10kbps minimum to prevent FFmpeg errors)
         if video_bitrate < 10000:
