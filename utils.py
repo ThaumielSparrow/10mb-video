@@ -79,3 +79,8 @@ def get_trim_bitrate(input_path, start, end, temp_dir="outputs"):
         if os.path.exists(temp_check_file):
             os.remove(temp_check_file)
         return None
+
+# Thin wrapper around `open` to load js files
+def load_js(filename:str) -> str:
+    with open(filename, "r") as f:
+        return f.read()

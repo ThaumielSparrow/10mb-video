@@ -1,5 +1,6 @@
 import gradio as gr
 from compressor import VideoCompressor
+from utils import load_js
 
 # Initialize Logic
 compressor = VideoCompressor()
@@ -113,41 +114,19 @@ with gr.Blocks(title="Smart Video Compressor") as demo:
         with gr.Column():
             video_output = gr.Video(label="Result")
 
-    # Events
-    def to_interactive_mode(choice):
-        if choice == "Custom":
-            return {
-                target_strict: gr.update(visible=False),
-                target_editable: gr.update(visible=True, value=None)
-            }
-        else:
-            return {
-                target_strict: gr.update(visible=True),
-                target_editable: gr.update(visible=False)
-            }
-        
+    # Events 
     target_strict.change(
-        fn=to_interactive_mode, 
+        fn=None, 
         inputs=target_strict, 
-        outputs=[target_strict, target_editable]
+        outputs=[target_strict, target_editable],
+        js=load_js("js/to_custom.js")
     )
 
-    def to_noninteractive_mode(choice):
-        if choice in presets:
-            return {
-                target_strict: gr.update(visible=True, value=choice),
-                target_editable: gr.update(visible=False)
-            }
-        else:
-            return {
-                target_strict: gr.update(visible=False),
-                target_editable: gr.update(visible=True)
-            }
-
     target_editable.input(
-        fn=to_noninteractive_mode,
+        fn=None,
         inputs=target_editable,
-        outputs=[target_strict, target_editable]
+        outputs=[target_strict, target_editable],
+        js=load_js("js/to_presets.js")
     )
 
     btn.click(
@@ -157,4 +136,4 @@ with gr.Blocks(title="Smart Video Compressor") as demo:
     )
 
 if __name__ == "__main__":
-    demo.queue().launch(server_name="0.0.0.0", server_port=7860)
+    demo.queue().launch(server_name="0.0.0.0", server_port=7860, inbrowser=True)
