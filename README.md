@@ -1,3 +1,14 @@
+---
+title: 10mb-video
+emoji: 📼
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+short_description: online video compressor
+---
+
+
 Video compressor inspired by [8mb.video](https://8mb.video).
 
 Supports predefined upload limits for some popular apps such as Discord as well as custom sizes.
