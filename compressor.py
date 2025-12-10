@@ -10,7 +10,14 @@ class VideoCompressor:
     def __init__(self, output_dir=OUTPUT_DIR):
         self.output_dir = output_dir
 
-    def compress(self, input_path, target_mb, remove_audio, start_time, end_time, progress_callback):
+    def compress(self, input_path, target_mb, remove_audio, start_time, end_time, speed_mode, progress_callback):
+        # Preset quality map
+        preset_map = {
+            "Prioritize Speed": "superfast",
+            "Prioritize Quality": "medium"
+        }
+
+        ffmpeg_preset = preset_map.get(speed_mode, "medium")
         
         # 1. Analyze Video
         progress_callback(0, desc="Analyzing Metadata...")
@@ -101,7 +108,7 @@ class VideoCompressor:
             "-y",
             *trim_args,
             *codec_args,
-            "-preset", "medium",
+            "-preset", ffmpeg_preset,
             "-b:v", v_bitrate_str,
             # Constrain bitrate to prevent massive spikes that overshoot size
             "-maxrate", str(int(video_bitrate * 1.5)),
