@@ -1,38 +1,148 @@
 import os
-import subprocess
 import re
-from utils import get_video_metadata, get_trim_bitrate
+import shutil
+import subprocess
+import tempfile
+import threading
+import time
+import uuid
+from utils import compute_bitrate_plan, get_trim_bitrate, get_video_metadata, pick_auto_resolution
 
-OUTPUT_DIR = "outputs"
+# Encode artifacts live in the platform tempdir so the working directory stays
+# clean. On Docker (production) this maps to /tmp, which is already ephemeral.
+OUTPUT_DIR = os.path.join(tempfile.gettempdir(), "10mb_video_outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Per-job subdirs in OUTPUT_DIR older than this get pruned at the start of each
+# compress() call. Long enough that a user has time to download; short enough that
+# the free-tier Space disk doesn't fill up.
+OUTPUT_TTL_SECONDS = 3600
+
+
+_RESOLUTION_HEIGHTS = {"720p": 720, "480p": 480, "360p": 360}
+
+
+def _resolve_target_height(output_resolution, source_height, source_width, source_fps, video_bitrate_bps):
+    """Translate the UI's output_resolution choice into an ffmpeg target height.
+
+    Returns 0 when no scale filter should be applied (Original, or when the
+    requested height equals/exceeds source).
+    """
+    if not source_height:
+        return 0
+    if output_resolution == "Auto":
+        picked = pick_auto_resolution(source_height, source_width, source_fps, video_bitrate_bps)
+        return picked if picked < source_height else 0
+    if output_resolution in _RESOLUTION_HEIGHTS:
+        height = _RESOLUTION_HEIGHTS[output_resolution]
+        return height if height < source_height else 0
+    # "Original" or anything unrecognised: no downscale.
+    return 0
+
+
+_ERROR_HINTS = ("Error", "Invalid", "not found", "Conversion failed", "No such")
+
+
+def _summarize_ffmpeg_error(stderr_buffer):
+    """Pull the most informative line out of ffmpeg's stderr tail.
+
+    ffmpeg emits a wall of progress lines and then a one-line root cause
+    near the bottom. We surface that single line so the gr.Error toast in
+    the UI doesn't display 50 lines of noise.
+    """
+    informative = None
+    for line in stderr_buffer:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if any(hint in stripped for hint in _ERROR_HINTS):
+            informative = stripped
+    if informative:
+        return informative
+    for line in reversed(stderr_buffer):
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return "ffmpeg failed (no stderr output)."
+
+
+class CompressionCancelled(Exception):
+    """Raised when a running encode is terminated by VideoCompressor.cancel()."""
+
 
 class VideoCompressor:
     def __init__(self, output_dir=OUTPUT_DIR):
+        for tool in ("ffmpeg", "ffprobe"):
+            if shutil.which(tool) is None:
+                raise RuntimeError(
+                    f"Required executable not found on PATH: {tool}. "
+                    "Install ffmpeg (the Dockerfile does this in production)."
+                )
         self.output_dir = output_dir
+        # Per-job subprocess tracking so cancel() can free CPU mid-encode.
+        # Keyed by the job_id passed into compress(). Guarded by _lock for
+        # safety against concurrent requests on the shared HF Space.
+        self._active = {}
+        self._cancelled = set()
+        self._lock = threading.Lock()
 
-    def compress(self, input_path, target_mb, remove_audio, start_time, end_time, speed_mode, progress_callback):
-        # Preset quality map
+    def _prune_old_outputs(self):
+        cutoff = time.time() - OUTPUT_TTL_SECONDS
+        try:
+            for entry in os.scandir(self.output_dir):
+                if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                    shutil.rmtree(entry.path, ignore_errors=True)
+        except OSError:
+            pass
+
+    def cancel(self, job_id):
+        """Terminate the active ffmpeg subprocess for job_id, if any."""
+        if not job_id:
+            return
+        with self._lock:
+            self._cancelled.add(job_id)
+            proc = self._active.get(job_id)
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def compress(self, job_id, input_path, target_mb, remove_audio, start_time, end_time, speed_mode, output_resolution, progress_callback):
+        self._prune_old_outputs()
+
+        if not job_id:
+            job_id = uuid.uuid4().hex[:12]
+
+        try:
+            return self._compress_inner(
+                job_id, input_path, target_mb, remove_audio,
+                start_time, end_time, speed_mode, output_resolution, progress_callback,
+            )
+        finally:
+            with self._lock:
+                self._cancelled.discard(job_id)
+                self._active.pop(job_id, None)
+
+    def _compress_inner(self, job_id, input_path, target_mb, remove_audio, start_time, end_time, speed_mode, output_resolution, progress_callback):
         preset_map = {
             "Prioritize Speed": "superfast",
             "Prioritize Quality": "medium"
         }
-
         ffmpeg_preset = preset_map.get(speed_mode, "medium")
-        
-        # 1. Analyze Video
+        single_pass = (speed_mode == "Prioritize Speed")
+
         progress_callback(0, desc="Analyzing Metadata...")
         meta = get_video_metadata(input_path)
-        
         if not meta:
             raise Exception("Could not read video metadata.")
 
-        # Handle Trimming Inputs
         s_time = float(start_time) if start_time else 0.0
         e_time = float(end_time) if end_time else meta["duration"]
-        
         if s_time < 0: s_time = 0
         if e_time > meta["duration"]: e_time = meta["duration"]
-        
+
         target_duration = e_time - s_time
         if target_duration <= 0:
             raise Exception("Invalid start/end time.")
@@ -43,146 +153,171 @@ class VideoCompressor:
         if (meta["size_bytes"] < target_bytes_strict) and not is_trimmed and not remove_audio:
             print("File is already below target size. Skipping encoding.")
             return input_path
-        
-        source_bitrate_cap = meta["bitrate"]
 
+        # Per-request working directory keeps output, two-pass logs, and the trim
+        # probe file isolated from concurrent jobs sharing the same Space.
+        job_dir = os.path.join(self.output_dir, job_id)
+        os.makedirs(job_dir, exist_ok=True)
+
+        source_bitrate_cap = meta["bitrate"]
         if is_trimmed:
             progress_callback(0, desc="Analyzing trimmed section...")
-            trim_bitrate = get_trim_bitrate(input_path, s_time, e_time, self.output_dir)
+            trim_bitrate = get_trim_bitrate(input_path, s_time, e_time, job_dir)
             if trim_bitrate:
                 source_bitrate_cap = trim_bitrate
                 print(f"Trim detected. Using local bitrate cap: {int(trim_bitrate/1024)}k (Global was {int(meta['bitrate']/1024)}k)")
 
-        # Reserve space for MP4 container overhead
-        if target_mb <= 20:
-            safety_buffer = 0.90 
-        else:
-            safety_buffer = 0.95
+        plan = compute_bitrate_plan(
+            target_mb=target_mb,
+            duration=target_duration,
+            has_audio=meta["has_audio"],
+            remove_audio=remove_audio,
+            source_bitrate_cap=source_bitrate_cap,
+        )
+        if plan is None:
+            raise Exception("Invalid bitrate plan (check target and duration).")
+        video_bitrate, audio_bitrate = plan
 
-        effective_target_bytes = target_bytes_strict * safety_buffer
-        total_bits_allowed = effective_target_bytes * 8
-        
-        # Calculate Audio Bitrate
-        audio_bitrate = 128 * 1024 # Standard 128k
-        should_process_audio = meta["has_audio"] and not remove_audio
-
-        if not should_process_audio:
-            audio_bitrate = 0
+        if remove_audio or not meta["has_audio"]:
             audio_args = ["-an"]
         else:
-            # Check if video bitrate would be too low
-            naive_video_bitrate = (total_bits_allowed / target_duration) - audio_bitrate
-            
-            # If video allows < 200kbps, drop audio to 64k to save space
-            if naive_video_bitrate < (200 * 1024):
-                audio_bitrate = 64 * 1024 
-            
             audio_args = ["-c:a", "aac", "-b:a", str(int(audio_bitrate))]
 
-        # Calculate Video Bitrate
-        target_total_bitrate = total_bits_allowed / target_duration
-        video_bitrate = target_total_bitrate - audio_bitrate
+        # Resolve output resolution. "Auto" picks the height that gives decent
+        # quality at the chosen bitrate; "Original" leaves it alone; fixed
+        # presets ("720p" etc.) are honored as-is. We never upscale.
+        source_height = meta.get("height") or 0
+        source_width = meta.get("width") or 0
+        source_fps = meta.get("fps") or 0
+        target_height = _resolve_target_height(
+            output_resolution, source_height, source_width, source_fps, video_bitrate,
+        )
+        scale_args = ["-vf", f"scale=-2:{target_height}"] if target_height and target_height < source_height else []
 
-        # Don't upscale bitrate if the source is already lower quality
-        if video_bitrate > source_bitrate_cap:
-            video_bitrate = source_bitrate_cap
-
-        # Safety floor (10kbps minimum to prevent FFmpeg errors)
-        if video_bitrate < 10000:
-            video_bitrate = 10000
-
-        # Construct FFmpeg Arguments
         base_name = os.path.splitext(os.path.basename(input_path))[0]
-        ext = "mp4"
-        output_path = os.path.join(self.output_dir, f"{base_name}_compressed.{ext}")
-        pass_log_prefix = os.path.join(self.output_dir, f"ffmpeg2pass_{base_name}")
+        output_path = os.path.join(job_dir, f"{base_name}_compressed.mp4")
 
         trim_args = ["-ss", str(s_time), "-to", str(e_time)] if is_trimmed else []
-
-        codec_args = ["-c:v", "libx264"]
-
-        # Helper to stringify bitrate
         v_bitrate_str = str(int(video_bitrate))
 
+        # -threads matches the HF Spaces Free tier vCPU count; libx264's auto-detect
+        # can over-subscribe on shared infra and slow encoding down.
         common_args = [
             "-y",
             *trim_args,
-            *codec_args,
+            *scale_args,
+            "-c:v", "libx264",
             "-preset", ffmpeg_preset,
+            "-threads", "2",
             "-b:v", v_bitrate_str,
-            # Constrain bitrate to prevent massive spikes that overshoot size
             "-maxrate", str(int(video_bitrate * 1.5)),
-            "-bufsize", str(int(video_bitrate * 2)), 
-            "-passlogfile", pass_log_prefix
+            "-bufsize", str(int(video_bitrate * 2)),
         ]
 
-        # PASS 1 (Analysis)
-        cmd_pass1 = [
-            "ffmpeg", "-i", input_path,
-            *common_args,
-            "-pass", "1",
-            "-an", 
-            "-f", "mp4", os.devnull # Windows-safe null output
-        ]
-        
-        self._run_ffmpeg_with_progress(
-            cmd_pass1, 
-            progress_callback, 
-            target_duration, 
-            progress_start=0.0, 
-            progress_end=0.25, 
-            description="Analyzing metadata..."
-        )
+        if single_pass:
+            # Speed mode: skip the analysis pass entirely. -tune fastdecode drops
+            # CABAC, which also trims a few % off encoder CPU.
+            cmd = [
+                "ffmpeg", "-i", input_path,
+                *common_args,
+                "-tune", "fastdecode",
+                *audio_args,
+                output_path
+            ]
+            self._run_ffmpeg_with_progress(
+                job_id, cmd, progress_callback, target_duration,
+                progress_start=0.0, progress_end=1.0,
+                description="Compressing..."
+            )
+        else:
+            pass_log_prefix = os.path.join(job_dir, "ffmpeg2pass")
+            pass_args = ["-passlogfile", pass_log_prefix]
 
-        # PASS 2 (Encoding)
-        cmd_pass2 = [
-            "ffmpeg", "-i", input_path,
-            *common_args,
-            "-pass", "2",
-            *audio_args,
-            output_path
-        ]
-        
-        self._run_ffmpeg_with_progress(
-            cmd_pass2, 
-            progress_callback, 
-            target_duration, 
-            progress_start=0.25, 
-            progress_end=1.0, 
-            description="Compressing..."
-        )
+            cmd_pass1 = [
+                "ffmpeg", "-i", input_path,
+                *common_args,
+                *pass_args,
+                "-pass", "1",
+                "-an",
+                "-f", "mp4", os.devnull
+            ]
+            self._run_ffmpeg_with_progress(
+                job_id, cmd_pass1, progress_callback, target_duration,
+                progress_start=0.0, progress_end=0.25,
+                description="Analyzing metadata..."
+            )
 
-        self._cleanup_logs(pass_log_prefix)
+            cmd_pass2 = [
+                "ffmpeg", "-i", input_path,
+                *common_args,
+                *pass_args,
+                "-pass", "2",
+                *audio_args,
+                output_path
+            ]
+            self._run_ffmpeg_with_progress(
+                job_id, cmd_pass2, progress_callback, target_duration,
+                progress_start=0.25, progress_end=1.0,
+                description="Compressing..."
+            )
+            self._cleanup_logs(pass_log_prefix)
+
         return output_path
 
-    def _run_ffmpeg_with_progress(self, cmd, progress_callback, total_duration, progress_start, progress_end, description):
+    def _run_ffmpeg_with_progress(self, job_id, cmd, progress_callback, total_duration, progress_start, progress_end, description):
         process = subprocess.Popen(
-            cmd, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.PIPE, 
-            universal_newlines=True
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
         )
+
+        with self._lock:
+            # Check for cancellation that arrived between job_id registration
+            # and now (the user could in theory click Cancel before Popen).
+            already_cancelled = job_id in self._cancelled
+            if already_cancelled:
+                process.terminate()
+            else:
+                self._active[job_id] = process
+
+        if already_cancelled:
+            process.wait()
+            raise CompressionCancelled("Compression cancelled.")
 
         stderr_buffer = []
         time_pattern = re.compile(r"time=(\d{2}):(\d{2}):(\d{2}\.\d+)")
+        # stderr is always a pipe because we pass stderr=subprocess.PIPE above;
+        # the assert lets pyright narrow the Optional type.
+        assert process.stderr is not None
 
-        for line in process.stderr: # type:ignore
-            stderr_buffer.append(line)
-            if len(stderr_buffer) > 50:
-                stderr_buffer.pop(0)
+        try:
+            for line in process.stderr:
+                stderr_buffer.append(line)
+                if len(stderr_buffer) > 50:
+                    stderr_buffer.pop(0)
 
-            match = time_pattern.search(line)
-            if match:
-                hours, minutes, seconds = map(float, match.groups())
-                current_time = hours * 3600 + minutes * 60 + seconds
-                fraction_complete = min(current_time / total_duration, 1.0)
-                global_progress = progress_start + (fraction_complete * (progress_end - progress_start))
-                progress_callback(global_progress, desc=f"{description}")
+                match = time_pattern.search(line)
+                if match:
+                    hours, minutes, seconds = map(float, match.groups())
+                    current_time = hours * 3600 + minutes * 60 + seconds
+                    fraction_complete = min(current_time / total_duration, 1.0)
+                    global_progress = progress_start + (fraction_complete * (progress_end - progress_start))
+                    progress_callback(global_progress, desc=description)
 
-        process.wait()
+            process.wait()
+        finally:
+            with self._lock:
+                self._active.pop(job_id, None)
+
+        with self._lock:
+            was_cancelled = job_id in self._cancelled
+
+        if was_cancelled:
+            raise CompressionCancelled("Compression cancelled.")
         if process.returncode != 0:
-            error_log = "".join(stderr_buffer)
-            raise Exception(f"FFmpeg Error (Exit Code {process.returncode}):\n{error_log}")
+            summary = _summarize_ffmpeg_error(stderr_buffer)
+            raise Exception(f"FFmpeg Error (Exit Code {process.returncode}): {summary}")
 
     def _cleanup_logs(self, prefix):
         try:
