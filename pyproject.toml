@@ -1,0 +1,11 @@
+[project]
+name = "10mb-video"
+version = "0.1.0"
+description = "Compress videos to a target file size — runs on free-tier Hugging Face Spaces."
+requires-python = ">=3.12"
+dependencies = [
+    "gradio",
+    # huggingface-hub 1.16 imports urllib3 in its inference provider modules
+    # but doesn't declare it as a dependency. Pin explicitly so `uv sync` works.
+    "urllib3>=2.7.0",
+]
