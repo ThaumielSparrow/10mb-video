@@ -6,7 +6,13 @@ import tempfile
 import threading
 import time
 import uuid
-from utils import compute_bitrate_plan, get_trim_bitrate, get_video_metadata, pick_auto_resolution
+from utils import (
+    compute_bitrate_plan,
+    get_trim_bitrate,
+    get_video_metadata,
+    pick_auto_fps_cap,
+    pick_auto_resolution,
+)
 
 # Encode artifacts live in the platform tempdir so the working directory stays
 # clean. On Docker (production) this maps to /tmp, which is already ephemeral.
@@ -18,8 +24,35 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # the free-tier Space disk doesn't fill up.
 OUTPUT_TTL_SECONDS = 3600
 
+# Free-tier HF Spaces have limited RAM and the ffmpeg decode path can balloon
+# quickly on large inputs. Reject sources above this size before we burn any
+# encode time — users with bigger sources should trim/downscale locally first.
+MAX_INPUT_MB = 500
+MAX_INPUT_BYTES = MAX_INPUT_MB * 1024 * 1024
+
 
 _RESOLUTION_HEIGHTS = {"720p": 720, "480p": 480, "360p": 360}
+
+# Hard fps cap when the user picks "On" or when "Auto" judges the source
+# starved enough. We never cap below 30 — choppier than that becomes noticeable
+# on all content, not just sports/fast-motion.
+_FPS_CAP = 30
+
+
+def _resolve_target_fps(fps_mode, source_fps, source_width, source_height, video_bitrate_bps):
+    """Translate fps_mode (Auto/On/Off) into the cap to apply (e.g. 30) or 0 for no cap.
+
+    Called *before* _resolve_target_height so the resolution picker sees the
+    post-cap effective fps. See pick_auto_fps_cap docstring for the math.
+    """
+    if not source_fps or source_fps <= _FPS_CAP:
+        return 0
+    if fps_mode == "Off":
+        return 0
+    if fps_mode == "On":
+        return _FPS_CAP
+    # "Auto" or anything unrecognized → defer to the bpp-based heuristic.
+    return pick_auto_fps_cap(source_fps, source_width, source_height, video_bitrate_bps, cap=_FPS_CAP)
 
 
 def _resolve_target_height(output_resolution, source_height, source_width, source_fps, video_bitrate_bps):
@@ -109,7 +142,7 @@ class VideoCompressor:
             except subprocess.TimeoutExpired:
                 proc.kill()
 
-    def compress(self, job_id, input_path, target_mb, remove_audio, start_time, end_time, speed_mode, output_resolution, progress_callback):
+    def compress(self, job_id, input_path, target_mb, remove_audio, start_time, end_time, speed_mode, output_resolution, fps_mode, progress_callback):
         self._prune_old_outputs()
 
         if not job_id:
@@ -118,20 +151,30 @@ class VideoCompressor:
         try:
             return self._compress_inner(
                 job_id, input_path, target_mb, remove_audio,
-                start_time, end_time, speed_mode, output_resolution, progress_callback,
+                start_time, end_time, speed_mode, output_resolution, fps_mode, progress_callback,
             )
         finally:
             with self._lock:
                 self._cancelled.discard(job_id)
                 self._active.pop(job_id, None)
 
-    def _compress_inner(self, job_id, input_path, target_mb, remove_audio, start_time, end_time, speed_mode, output_resolution, progress_callback):
+    def _compress_inner(self, job_id, input_path, target_mb, remove_audio, start_time, end_time, speed_mode, output_resolution, fps_mode, progress_callback):
+        try:
+            input_size = os.path.getsize(input_path)
+        except OSError as e:
+            raise Exception(f"Could not read input file: {e}")
+        if input_size > MAX_INPUT_BYTES:
+            size_mb = input_size / 1024 / 1024
+            raise Exception(
+                f"Upload is {size_mb:.0f} MB; the limit is {MAX_INPUT_MB} MB. "
+                "Trim or downscale the source locally first."
+            )
+
         preset_map = {
             "Prioritize Speed": "superfast",
             "Prioritize Quality": "medium"
         }
         ffmpeg_preset = preset_map.get(speed_mode, "medium")
-        single_pass = (speed_mode == "Prioritize Speed")
 
         progress_callback(0, desc="Analyzing Metadata...")
         meta = get_video_metadata(input_path)
@@ -183,16 +226,30 @@ class VideoCompressor:
         else:
             audio_args = ["-c:a", "aac", "-b:a", str(int(audio_bitrate))]
 
-        # Resolve output resolution. "Auto" picks the height that gives decent
-        # quality at the chosen bitrate; "Original" leaves it alone; fixed
-        # presets ("720p" etc.) are honored as-is. We never upscale.
+        # Resolve fps cap first so resolution picker sees the post-cap effective
+        # fps. Order matters: capping fps doubles bits-per-frame, which means
+        # Auto resolution can keep a higher resolution than it would otherwise.
         source_height = meta.get("height") or 0
         source_width = meta.get("width") or 0
         source_fps = meta.get("fps") or 0
-        target_height = _resolve_target_height(
-            output_resolution, source_height, source_width, source_fps, video_bitrate,
+        target_fps = _resolve_target_fps(
+            fps_mode, source_fps, source_width, source_height, video_bitrate,
         )
-        scale_args = ["-vf", f"scale=-2:{target_height}"] if target_height and target_height < source_height else []
+        effective_fps = target_fps if target_fps else source_fps
+
+        # Resolve output resolution. "Auto" picks the height that gives decent
+        # quality at the chosen bitrate; "Original" leaves it alone; fixed
+        # presets ("720p" etc.) are honored as-is. We never upscale.
+        target_height = _resolve_target_height(
+            output_resolution, source_height, source_width, effective_fps, video_bitrate,
+        )
+
+        vf_parts = []
+        if target_height and target_height < source_height:
+            vf_parts.append(f"scale=-2:{target_height}")
+        if target_fps:
+            vf_parts.append(f"fps={target_fps}")
+        scale_args = ["-vf", ",".join(vf_parts)] if vf_parts else []
 
         base_name = os.path.splitext(os.path.basename(input_path))[0]
         output_path = os.path.join(job_dir, f"{base_name}_compressed.mp4")
@@ -202,6 +259,12 @@ class VideoCompressor:
 
         # -threads matches the HF Spaces Free tier vCPU count; libx264's auto-detect
         # can over-subscribe on shared infra and slow encoding down.
+        # NOTE: two-pass *requires* the same -preset on both passes. A pass-1
+        # preset that strips features (e.g. ultrafast disables mbtree/cabac)
+        # produces a stats file that pass 2 refuses to consume ("Could not open
+        # encoder before EOF" / EINVAL). libx264 already optimizes pass 1
+        # internally via --slow-firstpass=0 (the default), so don't try to
+        # speed it up further by overriding the preset.
         common_args = [
             "-y",
             *trim_args,
@@ -214,53 +277,43 @@ class VideoCompressor:
             "-bufsize", str(int(video_bitrate * 2)),
         ]
 
-        if single_pass:
-            # Speed mode: skip the analysis pass entirely. -tune fastdecode drops
-            # CABAC, which also trims a few % off encoder CPU.
-            cmd = [
-                "ffmpeg", "-i", input_path,
-                *common_args,
-                "-tune", "fastdecode",
-                *audio_args,
-                output_path
-            ]
-            self._run_ffmpeg_with_progress(
-                job_id, cmd, progress_callback, target_duration,
-                progress_start=0.0, progress_end=1.0,
-                description="Compressing..."
-            )
-        else:
-            pass_log_prefix = os.path.join(job_dir, "ffmpeg2pass")
-            pass_args = ["-passlogfile", pass_log_prefix]
+        # Both Speed and Quality run two-pass; only the preset differs.
+        # Bench data (see bench.py) showed -tune fastdecode is a free quality
+        # loss across every metric and every content type (animation, gameplay,
+        # natural), and that single-pass at low target sizes gives up
+        # noticeable quality on varied content (e.g. ~+2 VMAF on animation
+        # when we switch to two-pass at the same superfast preset).
+        pass_log_prefix = os.path.join(job_dir, "ffmpeg2pass")
+        pass_args = ["-passlogfile", pass_log_prefix]
 
-            cmd_pass1 = [
-                "ffmpeg", "-i", input_path,
-                *common_args,
-                *pass_args,
-                "-pass", "1",
-                "-an",
-                "-f", "mp4", os.devnull
-            ]
-            self._run_ffmpeg_with_progress(
-                job_id, cmd_pass1, progress_callback, target_duration,
-                progress_start=0.0, progress_end=0.25,
-                description="Analyzing metadata..."
-            )
+        cmd_pass1 = [
+            "ffmpeg", "-i", input_path,
+            *common_args,
+            *pass_args,
+            "-pass", "1",
+            "-an",
+            "-f", "mp4", os.devnull
+        ]
+        self._run_ffmpeg_with_progress(
+            job_id, cmd_pass1, progress_callback, target_duration,
+            progress_start=0.0, progress_end=0.25,
+            description="Analyzing metadata..."
+        )
 
-            cmd_pass2 = [
-                "ffmpeg", "-i", input_path,
-                *common_args,
-                *pass_args,
-                "-pass", "2",
-                *audio_args,
-                output_path
-            ]
-            self._run_ffmpeg_with_progress(
-                job_id, cmd_pass2, progress_callback, target_duration,
-                progress_start=0.25, progress_end=1.0,
-                description="Compressing..."
-            )
-            self._cleanup_logs(pass_log_prefix)
+        cmd_pass2 = [
+            "ffmpeg", "-i", input_path,
+            *common_args,
+            *pass_args,
+            "-pass", "2",
+            *audio_args,
+            output_path
+        ]
+        self._run_ffmpeg_with_progress(
+            job_id, cmd_pass2, progress_callback, target_duration,
+            progress_start=0.25, progress_end=1.0,
+            description="Compressing..."
+        )
+        self._cleanup_logs(pass_log_prefix)
 
         return output_path
 

@@ -7,6 +7,7 @@ from utils import (
     compute_bitrate_plan,
     estimate_video_bitrate,
     get_video_metadata,
+    pick_auto_fps_cap,
     pick_auto_resolution,
 )
 
@@ -15,6 +16,7 @@ compressor = VideoCompressor()
 PRESETS = ["8 MB", "10 MB", "25 MB", "50 MB", "Custom"]
 RESOLUTION_CHOICES = ["Auto", "Original", "720p", "480p", "360p"]
 RESOLUTION_HEIGHTS = {"720p": 720, "480p": 480, "360p": 360}
+FPS_CHOICES = ["Auto", "On", "Off"]
 LOW_BITRATE_WARN_KBPS = 200
 
 
@@ -46,12 +48,29 @@ def _effective_height(output_resolution, source_height, source_width, source_fps
     return source_height  # "Original"
 
 
+_FPS_CAP = 30
+
+
+def _resolve_fps_cap(fps_mode, source_fps, source_width, source_height, video_bitrate_bps):
+    """Mirror of compressor._resolve_target_fps for the UI's summary line.
+
+    Returns the cap to apply (e.g. 30) or 0 for no cap.
+    """
+    if not source_fps or source_fps <= _FPS_CAP:
+        return 0
+    if fps_mode == "Off":
+        return 0
+    if fps_mode == "On":
+        return _FPS_CAP
+    return pick_auto_fps_cap(source_fps, source_width, source_height, video_bitrate_bps or 0, cap=_FPS_CAP)
+
+
 def prepare_job():
     """Generate the job id before compress runs so the cancel button can target it."""
     return uuid.uuid4().hex[:12]
 
 
-def processing_function(job_id, video_file, preset, custom_mb, remove_audio, speed_mode, output_resolution, start_time, end_time, progress=gr.Progress()):
+def processing_function(job_id, video_file, preset, custom_mb, remove_audio, speed_mode, output_resolution, fps_mode, start_time, end_time, progress=gr.Progress()):
     if video_file is None:
         return None
 
@@ -67,6 +86,7 @@ def processing_function(job_id, video_file, preset, custom_mb, remove_audio, spe
             end_time=end_time,
             speed_mode=speed_mode,
             output_resolution=output_resolution,
+            fps_mode=fps_mode,
             progress_callback=progress,
         )
     except CompressionCancelled:
@@ -110,7 +130,7 @@ def cancel_active_job(job_id):
     return gr.update(visible=True), gr.update(visible=False), None, ""
 
 
-def _format_summary(meta, preset, custom_mb, remove_audio, output_resolution, start_time, end_time):
+def _format_summary(meta, preset, custom_mb, remove_audio, output_resolution, fps_mode, start_time, end_time):
     if not meta:
         return ""
 
@@ -175,9 +195,16 @@ def _format_summary(meta, preset, custom_mb, remove_audio, output_resolution, st
     source_height = meta.get("height") or 0
     source_width = meta.get("width") or 0
     source_fps = meta.get("fps") or 0
+
+    # Resolve fps cap first — it affects the effective fps the resolution
+    # picker sees (capping fps doubles per-frame bits, so the picker may keep
+    # a higher resolution).
+    fps_cap = _resolve_fps_cap(fps_mode, source_fps, source_width, source_height, bitrate)
+    effective_fps = fps_cap if fps_cap else source_fps
+
     if source_height:
-        effective_h = _effective_height(output_resolution, source_height, source_width, source_fps, bitrate)
-        auto_pick = pick_auto_resolution(source_height, source_width, source_fps, bitrate)
+        effective_h = _effective_height(output_resolution, source_height, source_width, effective_fps, bitrate)
+        auto_pick = pick_auto_resolution(source_height, source_width, effective_fps, bitrate)
         if output_resolution == "Auto":
             if effective_h < source_height:
                 lines.append(f"**Resolution:** Auto &rarr; {effective_h}p (source is {source_height}p)")
@@ -194,10 +221,17 @@ def _format_summary(meta, preset, custom_mb, remove_audio, output_resolution, st
                 tip = f"  &mdash; **tip:** {auto_pick}p would look better at this bitrate"
             lines.append(f"**Resolution:** {effective_h}p{tip}")
 
+    if source_fps:
+        if fps_cap:
+            tag = "Auto &rarr; 30 fps" if fps_mode == "Auto" else "30 fps"
+            lines.append(f"**Framerate:** {tag} (source is {source_fps:.0f} fps)")
+        elif fps_mode == "Auto" and source_fps > 30:
+            lines.append(f"**Framerate:** Auto &rarr; keeping {source_fps:.0f} fps (bitrate is sufficient)")
+
     return "\n\n".join(lines)
 
 
-def on_video_upload(video_path, preset, custom_mb, remove_audio, output_resolution, _start_time, _end_time):
+def on_video_upload(video_path, preset, custom_mb, remove_audio, output_resolution, fps_mode, _start_time, _end_time):
     # _start_time/_end_time are bound by the event but ignored: a new upload
     # resets trim to (0, full_duration), so we recompute the summary against
     # the source duration rather than carrying over the previous trim values.
@@ -217,14 +251,14 @@ def on_video_upload(video_path, preset, custom_mb, remove_audio, output_resoluti
         maximum=duration,
         label=f"End (sec) — source is {duration:.1f}s",
     )
-    summary = _format_summary(meta, preset, custom_mb, remove_audio, output_resolution, 0, None)
+    summary = _format_summary(meta, preset, custom_mb, remove_audio, output_resolution, fps_mode, 0, None)
     return meta, summary, start_update, end_update
 
 
-def on_settings_change(meta, preset, custom_mb, remove_audio, output_resolution, start_time, end_time):
+def on_settings_change(meta, preset, custom_mb, remove_audio, output_resolution, fps_mode, start_time, end_time):
     if not meta:
         return ""
-    return _format_summary(meta, preset, custom_mb, remove_audio, output_resolution, start_time, end_time)
+    return _format_summary(meta, preset, custom_mb, remove_audio, output_resolution, fps_mode, start_time, end_time)
 
 
 def on_preset_change(preset):
@@ -279,14 +313,23 @@ with gr.Blocks(title="Smart Video Compressor") as demo:
                     label="Output Resolution",
                     filterable=False,
                     allow_custom_value=False,
-                    scale=3,
-                    min_width=150,
+                    scale=2,
+                    min_width=140,
+                )
+                fps_mode = gr.Dropdown(
+                    choices=FPS_CHOICES,
+                    value="Auto",
+                    label="Reduce FPS",
+                    filterable=False,
+                    allow_custom_value=False,
+                    scale=2,
+                    min_width=130,
                 )
                 remove_audio = gr.Checkbox(
                     label="Remove Audio",
                     value=False,
                     scale=2,
-                    min_width=140,
+                    min_width=130,
                 )
 
             with gr.Accordion("Trimming Options", open=True):
@@ -308,15 +351,15 @@ with gr.Blocks(title="Smart Video Compressor") as demo:
         outputs=target_custom,
     )
 
-    summary_inputs = [meta_state, target_preset, target_custom, remove_audio, resolution, start_t, end_t]
+    summary_inputs = [meta_state, target_preset, target_custom, remove_audio, resolution, fps_mode, start_t, end_t]
 
     video_input.change(
         fn=on_video_upload,
-        inputs=[video_input, target_preset, target_custom, remove_audio, resolution, start_t, end_t],
+        inputs=[video_input, target_preset, target_custom, remove_audio, resolution, fps_mode, start_t, end_t],
         outputs=[meta_state, summary_md, start_t, end_t],
     )
 
-    for component in (target_preset, target_custom, remove_audio, resolution, start_t, end_t):
+    for component in (target_preset, target_custom, remove_audio, resolution, fps_mode, start_t, end_t):
         trigger = component.input if hasattr(component, "input") else component.change
         trigger(
             fn=on_settings_change,
@@ -339,7 +382,7 @@ with gr.Blocks(title="Smart Video Compressor") as demo:
     # paint a second progress overlay on it during the long compress.
     compress_event = prep_event.then(
         fn=processing_function,
-        inputs=[active_job, video_input, target_preset, target_custom, remove_audio, speed_mode, resolution, start_t, end_t],
+        inputs=[active_job, video_input, target_preset, target_custom, remove_audio, speed_mode, resolution, fps_mode, start_t, end_t],
         outputs=video_output,
     )
     compress_event.then(

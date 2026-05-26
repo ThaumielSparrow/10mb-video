@@ -124,6 +124,31 @@ def pick_auto_resolution(source_height, source_width, source_fps, video_bitrate_
     # highest bpp given the same bitrate budget).
     return candidates[-1]
 
+def pick_auto_fps_cap(source_fps, source_width, source_height, video_bitrate_bps, cap=30):
+    """
+    Decide whether to cap framerate. Returns the cap (e.g. 30) or 0 for no cap.
+
+    Auto-cap fires only when bits-per-pixel-per-frame at source dimensions is
+    below half of QUALITY_BPP_TARGET — i.e., the encoder is so starved for bits
+    that trading half the frames for twice the per-frame budget is clearly a
+    win. At healthier bitrates we keep source fps and let Auto resolution
+    handle quality.
+
+    This runs *before* pick_auto_resolution so resolution decisions reflect the
+    post-cap effective fps. Order matters: capping first means Auto resolution
+    sees a doubled per-frame budget and can keep a higher resolution.
+
+    Never caps below 30 fps — below that motion looks choppy regardless of
+    content. Never caps when the source is already at or below the cap.
+    """
+    if not source_fps or source_fps <= cap:
+        return 0
+    if not source_width or not source_height or video_bitrate_bps <= 0:
+        return 0
+    bpp = video_bitrate_bps / (source_width * source_height * source_fps)
+    return cap if bpp < QUALITY_BPP_TARGET / 2 else 0
+
+
 def get_trim_bitrate(input_path, start, end, work_dir):
     """
     Performs a temporary Stream Copy trim to measure the EXACT bitrate
