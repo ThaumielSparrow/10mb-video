@@ -13,4 +13,6 @@ Video compressor inspired by [8mb.video](https://8mb.video).
 
 Supports predefined upload limits for some popular apps such as Discord as well as custom sizes.
 
-Uses a 2-pass encoding for best quality. Runs entirely on CPU using ffmpeg's libx264 CRF. 
+**Fast** compresses on your own device with the browser's hardware video encoder (WebCodecs, via [Mediabunny](https://mediabunny.dev)), so the clip is never uploaded. Browsers without a usable hardware H.264 encoder fall back to the server automatically.
+
+**Best quality** uploads the clip and runs a 2-pass libx264 encode on the server (CPU only).

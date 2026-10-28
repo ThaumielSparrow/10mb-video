@@ -3,3 +3,4 @@ outputs/
 .venv/
 test/
 tools/
+webbench/out*/

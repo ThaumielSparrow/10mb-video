@@ -135,10 +135,11 @@ QUALITY_BPP_TARGET = 0.05
 DEFAULT_FPS = 30.0
 
 
-def pick_auto_resolution(source_height, source_width, source_fps, video_bitrate_bps):
+def pick_auto_resolution(source_height, source_width, source_fps, video_bitrate_bps, bpp_target=QUALITY_BPP_TARGET):
     """
     Compute the largest standard resolution height where the per-pixel-per-frame
-    bitrate budget meets QUALITY_BPP_TARGET. Caps at source dimensions — we
+    bitrate budget meets bpp_target (QUALITY_BPP_TARGET for x264; encoders that
+    need more bits per pixel pass a higher one). Caps at source dimensions — we
     never upscale.
 
     bpp = bitrate / (width * height * fps). Higher = better visual quality.
@@ -175,7 +176,7 @@ def pick_auto_resolution(source_height, source_width, source_fps, video_bitrate_
         if pixels_per_sec <= 0:
             continue
         bpp = video_bitrate_bps / pixels_per_sec
-        if bpp >= QUALITY_BPP_TARGET:
+        if bpp >= bpp_target:
             return h
 
     # Every candidate is below target — pick the smallest (which has the

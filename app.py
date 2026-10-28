@@ -1,426 +1,177 @@
 import os
-import uuid
+from pathlib import Path
 
 import gradio as gr
-from compressor import MAX_INPUT_MB, OUTPUT_TTL_SECONDS, CompressionCancelled, VideoCompressor
-from utils import (
-    compute_bitrate_plan,
-    estimate_video_bitrate,
-    get_video_metadata,
-    pick_auto_fps_cap,
-    pick_auto_resolution,
-    pick_passthrough,
-)
+from gradio.utils import get_upload_folder
+
+from compressor import MAX_INPUT_MB, OUTPUT_DIR, OUTPUT_TTL_SECONDS, VideoCompressor, build_plan
+from jobs import JobQueue, QueueFull
+from utils import QUALITY_BPP_TARGET
 
 compressor = VideoCompressor()
+jobs = JobQueue(compressor)
 
-PRESETS = ["8 MB", "10 MB", "25 MB", "50 MB", "Custom"]
-RESOLUTION_CHOICES = ["Auto", "Original", "720p", "480p", "360p"]
-RESOLUTION_HEIGHTS = {"720p": 720, "480p": 480, "360p": 360}
-FPS_CHOICES = ["Auto", "On", "Off"]
-LOW_BITRATE_WARN_KBPS = 200
+WEB_DIR = Path(__file__).parent / "web"
 
+RESOLUTION_CHOICES = ("Auto", "Original", "720p", "480p", "360p")
+FPS_CHOICES = ("Auto", "On", "Off")
+# "Fast" falls back to the server only when this browser can't encode; it then
+# uses the speed preset. "Best quality" always runs x264 medium two-pass.
+SPEED_MODES = {"fast": "Prioritize Speed", "quality": "Prioritize Quality"}
+LOW_BITRATE_WARN_BPS = 200_000
 
-def _resolve_target_mb(preset, custom_mb):
-    if preset == "Custom":
-        if custom_mb is None:
-            raise gr.Error("Enter a custom size in MB.")
-        try:
-            target_mb = float(custom_mb)
-        except (TypeError, ValueError):
-            raise gr.Error("Invalid custom size. Please enter a valid number.")
-        if target_mb <= 0:
-            raise gr.Error("Custom size must be greater than 0.")
-        return target_mb
-    return float(preset.lower().replace("mb", "").strip())
+# Scales the bits-per-pixel target Auto resolution uses for the on-device
+# (WebCodecs hardware H.264) encode. Benched on Chrome/AMD: one ladder step
+# lower helped a grainy 1080p60 clip (SSIM 0.921 -> 0.931) but hurt a 720p
+# HEVC clip (0.965 -> 0.940), so there's no consistent case for moving it
+# off x264's target yet. Re-tune with real phone footage via webbench/.
+DEVICE_BPP_SCALE = 1.0
 
 
-def _effective_height(output_resolution, source_height, source_width, source_fps, video_bitrate_bps):
-    """Mirror of compressor._resolve_target_height for the UI's summary line.
+def _number(value, name, minimum=None, maximum=None, default=None):
+    if value is None or value == "":
+        if default is not None:
+            return default
+        raise ValueError(f"Missing {name}.")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number.") from None
+    if number != number or (minimum is not None and number < minimum) or (maximum is not None and number > maximum):
+        raise ValueError(f"{name} is out of range.")
+    return number
 
-    Returns the height that will actually be encoded (capped at source).
+
+def _settings(raw):
+    """Validate the page's settings dict (it comes straight from the browser)."""
+    raw = raw or {}
+    resolution = raw.get("resolution", "Auto")
+    fps_mode = raw.get("fps_mode", "Auto")
+    mode = raw.get("mode", "fast")
+    if resolution not in RESOLUTION_CHOICES or fps_mode not in FPS_CHOICES or mode not in SPEED_MODES:
+        raise ValueError("Unknown option.")
+    start = _number(raw.get("start"), "Start", minimum=0, default=0.0)
+    end = raw.get("end")
+    return {
+        "target_mb": _number(raw.get("target_mb"), "Target size", minimum=0.1, maximum=2000),
+        "remove_audio": bool(raw.get("remove_audio")),
+        "start": start,
+        "end": None if end in (None, "") else _number(end, "End", minimum=0),
+        "resolution": resolution,
+        "fps_mode": fps_mode,
+        "mode": mode,
+    }
+
+
+def _client_meta(raw):
+    """Metadata the browser probed from the file (Mediabunny), in get_video_metadata's shape."""
+    raw = raw or {}
+    duration = _number(raw.get("duration"), "Duration", minimum=0.01)
+    size = _number(raw.get("size_bytes"), "File size", minimum=1)
+    ext = str(raw.get("container_ext") or "").lower()[:8]
+    codec = raw.get("video_codec")
+    return {
+        "duration": duration,
+        "size_bytes": size,
+        "bitrate": size * 8 / duration,
+        "has_audio": bool(raw.get("has_audio")),
+        "video_codec": str(codec)[:16] if codec else None,
+        "container_ext": ext,
+        "width": int(_number(raw.get("width"), "Width", minimum=0, default=0)) or None,
+        "height": int(_number(raw.get("height"), "Height", minimum=0, default=0)) or None,
+        "fps": _number(raw.get("fps"), "Frame rate", minimum=0, default=0.0) or None,
+    }
+
+
+def plan_job(req):
+    """Plan for the summary and, when the browser encodes, for its encoder.
+
+    Same build_plan the server pipeline uses, fed the browser's own probe of
+    the file, so nothing about the file has to be uploaded to plan it.
     """
-    if not source_height:
-        return 0
-    if output_resolution == "Auto":
-        return pick_auto_resolution(source_height, source_width, source_fps, video_bitrate_bps or 0)
-    if output_resolution in RESOLUTION_HEIGHTS:
-        return min(RESOLUTION_HEIGHTS[output_resolution], source_height)
-    return source_height  # "Original"
-
-
-_FPS_CAP = 30
-
-
-def _resolve_fps_cap(fps_mode, source_fps, source_width, source_height, video_bitrate_bps):
-    """Mirror of compressor._resolve_target_fps for the UI's summary line.
-
-    Returns the cap to apply (e.g. 30) or 0 for no cap.
-    """
-    if not source_fps or source_fps <= _FPS_CAP:
-        return 0
-    if fps_mode == "Off":
-        return 0
-    if fps_mode == "On":
-        return _FPS_CAP
-    return pick_auto_fps_cap(source_fps, source_width, source_height, video_bitrate_bps or 0, cap=_FPS_CAP)
-
-
-def prepare_job():
-    """Generate the job id before compress runs so the cancel button can target it."""
-    return uuid.uuid4().hex[:12]
-
-
-def processing_function(job_id, video_file, preset, custom_mb, remove_audio, speed_mode, output_resolution, fps_mode, start_time, end_time, progress=gr.Progress()):
-    if video_file is None:
-        return None
-
-    target_mb = _resolve_target_mb(preset, custom_mb)
-
     try:
-        return compressor.compress(
-            job_id=job_id,
-            input_path=video_file,
-            target_mb=target_mb,
-            remove_audio=remove_audio,
-            start_time=start_time,
-            end_time=end_time,
-            speed_mode=speed_mode,
-            output_resolution=output_resolution,
-            fps_mode=fps_mode,
-            progress_callback=progress,
+        settings = _settings(req.get("settings"))
+        meta = _client_meta(req.get("meta"))
+        bpp = QUALITY_BPP_TARGET * (DEVICE_BPP_SCALE if req.get("device") else 1.0)
+        plan = build_plan(
+            meta, settings["target_mb"], settings["remove_audio"], settings["start"], settings["end"],
+            settings["resolution"], settings["fps_mode"], bpp_target=bpp,
         )
-    except CompressionCancelled:
-        return None
-    except Exception as e:
-        raise gr.Error(f"Compression failed: {str(e)}")
+    except ValueError as e:
+        return {"error": str(e)}
+    plan["target_bytes"] = settings["target_mb"] * 1024 * 1024
+    plan["low_quality"] = plan["video_bitrate"] < LOW_BITRATE_WARN_BPS
+    return plan
 
 
-def make_result_message(output_path, original_path, preset, custom_mb):
-    """Compute the post-encode size summary. Runs in a separate .then() after
-    processing_function so it isn't an output of the long-running compress
-    event — otherwise Gradio paints a second progress overlay on result_md."""
-    if not output_path:
-        return ""
+def start_job(req):
+    """Queue a server encode of a file the page already uploaded."""
     try:
-        target_mb = _resolve_target_mb(preset, custom_mb)
-    except gr.Error:
-        return ""
-
-    if output_path == original_path:
-        return "**Source was already under target — returned unchanged.**"
-
+        settings = _settings(req.get("settings"))
+    except ValueError as e:
+        return {"error": str(e)}
+    # The path comes from the browser: only accept files Gradio's upload
+    # endpoint wrote, never an arbitrary path on the server.
+    upload_dir = os.path.realpath(get_upload_folder())
+    path = os.path.realpath(str(req.get("path") or ""))
+    if os.path.commonpath([upload_dir, path]) != upload_dir or not os.path.isfile(path):
+        return {"error": "Upload not found. Choose the file again."}
     try:
-        size_mb = os.path.getsize(output_path) / 1024 / 1024
-    except OSError:
-        return ""
-
-    delta = size_mb - target_mb
-    if delta > 0.5:
-        status = f" (overshot by {delta:.1f} MB)"
-    elif delta < -2:
-        status = f" (well under, {abs(delta):.1f} MB headroom)"
-    else:
-        status = " (on target)"
-    return f"**Output:** {size_mb:.2f} MB / {target_mb:g} MB target{status}"
-
-
-def cancel_active_job(job_id):
-    if job_id:
-        compressor.cancel(job_id)
-    return gr.update(visible=True), gr.update(visible=False), None, ""
+        job_id = jobs.submit(path, {
+            "target_mb": settings["target_mb"],
+            "remove_audio": settings["remove_audio"],
+            "start_time": settings["start"],
+            "end_time": settings["end"],
+            "speed_mode": SPEED_MODES[settings["mode"]],
+            "output_resolution": settings["resolution"],
+            "fps_mode": settings["fps_mode"],
+        })
+    except QueueFull as e:
+        return {"error": str(e)}
+    return {"job_id": job_id}
 
 
-def _format_summary(meta, preset, custom_mb, remove_audio, output_resolution, fps_mode, start_time, end_time):
-    if not meta:
-        return ""
-
-    duration = meta["duration"]
-    s_time = float(start_time) if start_time else 0.0
-    e_time = float(end_time) if end_time else duration
-    s_time = max(s_time, 0.0)
-    e_time = min(e_time, duration)
-    effective_duration = max(e_time - s_time, 0.0)
-    is_trimmed = (s_time > 0 or e_time < duration)
-
-    try:
-        target_mb = _resolve_target_mb(preset, custom_mb)
-    except gr.Error:
-        target_mb = None
-
-    res_str = f"{meta['width']}x{meta['height']}" if meta.get("width") and meta.get("height") else "unknown resolution"
-    lines = [
-        f"**Source:** {meta['size_bytes'] / 1024 / 1024:.1f} MB &middot; "
-        f"{duration:.1f}s &middot; "
-        f"{res_str} &middot; "
-        f"{'audio present' if meta['has_audio'] else 'no audio'}"
-    ]
-
-    if effective_duration <= 0:
-        lines.append("_Trim range is empty._")
-        return "\n\n".join(lines)
-
-    if target_mb is None:
-        return "\n\n".join(lines)
-
-    passthrough, _ = pick_passthrough(meta, target_mb, is_trimmed, remove_audio)
-    if passthrough == "unchanged":
-        lines.append(
-            f"**Source is already under {target_mb:g} MB** &mdash; Compress will return "
-            "the original file unchanged."
-        )
-        return "\n\n".join(lines)
-    if passthrough == "remux":
-        action = "drop the audio track" if remove_audio else "repackage it as MP4"
-        lines.append(
-            f"**Source is already under {target_mb:g} MB** &mdash; Compress will "
-            f"{action} without re-encoding."
-        )
-        return "\n\n".join(lines)
-
-    plan = compute_bitrate_plan(
-        target_mb=target_mb,
-        duration=effective_duration,
-        has_audio=meta["has_audio"],
-        remove_audio=remove_audio,
-        source_bitrate_cap=meta.get("bitrate"),
-    )
-    bitrate = estimate_video_bitrate(meta, target_mb, remove_audio, effective_duration)
-    if bitrate is None or plan is None:
-        return "\n\n".join(lines)
-
-    kbps = bitrate / 1000
-    video_bps, audio_bps = plan
-    estimated_mb = (video_bps + audio_bps) * effective_duration / 8 / 1024 / 1024
-
-    range_note = f" (trim: {s_time:.1f}s &ndash; {e_time:.1f}s)" if is_trimmed else ""
-    quality_warn = "  &mdash; **warning: very low quality**" if kbps < LOW_BITRATE_WARN_KBPS else ""
-    lines.append(
-        f"**Estimated output:** ~{estimated_mb:.1f} MB &middot; "
-        f"{kbps:.0f} kbps video{quality_warn}{range_note}"
-    )
-
-    source_height = meta.get("height") or 0
-    source_width = meta.get("width") or 0
-    source_fps = meta.get("fps") or 0
-
-    # Resolve fps cap first — it affects the effective fps the resolution
-    # picker sees (capping fps doubles per-frame bits, so the picker may keep
-    # a higher resolution).
-    fps_cap = _resolve_fps_cap(fps_mode, source_fps, source_width, source_height, bitrate)
-    effective_fps = fps_cap if fps_cap else source_fps
-
-    # Resolutions name the short side ("720p" portrait = 720x1280), matching
-    # compressor; from here on source_height/width mean short/long side.
-    if source_width:
-        source_height, source_width = min(source_width, source_height), max(source_width, source_height)
-
-    if source_height:
-        effective_h = _effective_height(output_resolution, source_height, source_width, effective_fps, bitrate)
-        auto_pick = pick_auto_resolution(source_height, source_width, effective_fps, bitrate)
-        if output_resolution == "Auto":
-            if effective_h < source_height:
-                lines.append(f"**Resolution:** Auto &rarr; {effective_h}p (source is {source_height}p)")
-            else:
-                lines.append(f"**Resolution:** Auto &rarr; original ({source_height}p)")
-        elif output_resolution == "Original":
-            tip = ""
-            if auto_pick < source_height:
-                tip = f"  &mdash; **tip:** {auto_pick}p would look better at this bitrate"
-            lines.append(f"**Resolution:** Original ({source_height}p){tip}")
-        else:
-            tip = ""
-            if effective_h > auto_pick:
-                tip = f"  &mdash; **tip:** {auto_pick}p would look better at this bitrate"
-            lines.append(f"**Resolution:** {effective_h}p{tip}")
-
-    if source_fps:
-        if fps_cap:
-            tag = "Auto &rarr; 30 fps" if fps_mode == "Auto" else "30 fps"
-            lines.append(f"**Framerate:** {tag} (source is {source_fps:.0f} fps)")
-        elif fps_mode == "Auto" and source_fps > 30:
-            lines.append(f"**Framerate:** Auto &rarr; keeping {source_fps:.0f} fps (bitrate is sufficient)")
-
-    return "\n\n".join(lines)
+def job_status(req):
+    status = jobs.status(str(req.get("job_id") or ""))
+    if status is None:
+        return {"state": "error", "error": "This job has expired. Compress the file again."}
+    output = status.pop("output")
+    if output:
+        status["url"] = f"gradio_api/file={output}"
+        status["size"] = os.path.getsize(output)
+    return status
 
 
-def on_video_upload(video_path, preset, custom_mb, remove_audio, output_resolution, fps_mode, _start_time, _end_time):
-    # _start_time/_end_time are bound by the event but ignored: a new upload
-    # resets trim to (0, full_duration), so we recompute the summary against
-    # the source duration rather than carrying over the previous trim values.
-    if not video_path:
-        return None, "", gr.update(value=0), gr.update(value=None)
-    meta = get_video_metadata(video_path)
-    if not meta:
-        return None, "_Could not read video metadata._", gr.update(value=0), gr.update(value=None)
-    duration = meta["duration"]
-    start_update = gr.update(
-        value=0,
-        maximum=duration,
-        label=f"Start (sec) — source is {duration:.1f}s",
-    )
-    end_update = gr.update(
-        value=None,
-        maximum=duration,
-        label=f"End (sec) — source is {duration:.1f}s",
-    )
-    summary = _format_summary(meta, preset, custom_mb, remove_audio, output_resolution, fps_mode, 0, None)
-    return meta, summary, start_update, end_update
+def cancel_job(req):
+    jobs.cancel(str(req.get("job_id") or ""))
+    return {"ok": True}
 
 
-def on_settings_change(meta, preset, custom_mb, remove_audio, output_resolution, fps_mode, start_time, end_time):
-    if not meta:
-        return ""
-    return _format_summary(meta, preset, custom_mb, remove_audio, output_resolution, fps_mode, start_time, end_time)
+def _asset(name):
+    return (WEB_DIR / name).read_text(encoding="utf-8")
 
 
-def on_preset_change(preset):
-    return gr.update(visible=(preset == "Custom"))
-
-
-# Gradio keeps every upload (up to MAX_INPUT_MB each) and a copy of every result
-# in its own cache forever by default; sweep it on the same TTL as our outputs
-# so a busy Space doesn't fill its disk.
-with gr.Blocks(title="Smart Video Compressor", delete_cache=(900, OUTPUT_TTL_SECONDS)) as demo:
-    gr.Markdown("# 📼 Smart Video Compressor")
-    gr.Markdown("Compress videos to a specific size, inspired by 8mb.video.")
-
-    meta_state = gr.State(value=None)
-    active_job = gr.State(value=None)
-
-    with gr.Row():
-        with gr.Column():
-            video_input = gr.Video(label="Upload Video", sources=["upload"])
-            summary_md = gr.Markdown("")
-
-            with gr.Row():
-                target_preset = gr.Dropdown(
-                    choices=PRESETS,
-                    value="10 MB",
-                    label="Target File Size",
-                    filterable=False,
-                    allow_custom_value=False,
-                    scale=2,
-                    min_width=130,
-                )
-                target_custom = gr.Number(
-                    label="Custom size (MB)",
-                    value=10,
-                    minimum=1,
-                    maximum=2000,
-                    visible=False,
-                    scale=2,
-                    min_width=120,
-                )
-                speed_mode = gr.Dropdown(
-                    choices=["Prioritize Speed", "Prioritize Quality"],
-                    value="Prioritize Speed",
-                    label="Encoding Preset",
-                    filterable=False,
-                    allow_custom_value=False,
-                    scale=2,
-                    min_width=140,
-                )
-
-            with gr.Row():
-                resolution = gr.Dropdown(
-                    choices=RESOLUTION_CHOICES,
-                    value="Auto",
-                    label="Output Resolution",
-                    filterable=False,
-                    allow_custom_value=False,
-                    scale=2,
-                    min_width=140,
-                )
-                fps_mode = gr.Dropdown(
-                    choices=FPS_CHOICES,
-                    value="Auto",
-                    label="Reduce FPS",
-                    filterable=False,
-                    allow_custom_value=False,
-                    scale=2,
-                    min_width=130,
-                )
-                remove_audio = gr.Checkbox(
-                    label="Remove Audio",
-                    value=False,
-                    scale=2,
-                    min_width=130,
-                )
-
-            with gr.Accordion("Trimming Options", open=True):
-                with gr.Row():
-                    start_t = gr.Number(label="Start (sec)", value=0)
-                    end_t = gr.Number(label="End (sec)", value=None)
-
-            with gr.Row():
-                btn = gr.Button("Compress", variant="primary", scale=3)
-                cancel_btn = gr.Button("Cancel", variant="stop", scale=1, visible=False)
-
-        with gr.Column():
-            video_output = gr.Video(label="Result", interactive=False)
-            result_md = gr.Markdown("")
-
-    target_preset.change(
-        fn=on_preset_change,
-        inputs=target_preset,
-        outputs=target_custom,
-    )
-
-    summary_inputs = [meta_state, target_preset, target_custom, remove_audio, resolution, fps_mode, start_t, end_t]
-
-    video_input.change(
-        fn=on_video_upload,
-        inputs=[video_input, target_preset, target_custom, remove_audio, resolution, fps_mode, start_t, end_t],
-        outputs=[meta_state, summary_md, start_t, end_t],
-    )
-
-    for component in (target_preset, target_custom, remove_audio, resolution, fps_mode, start_t, end_t):
-        trigger = component.input if hasattr(component, "input") else component.change
-        trigger(
-            fn=on_settings_change,
-            inputs=summary_inputs,
-            outputs=summary_md,
-        )
-
-    # Generate the job id, clear any stale result message, and flip the UI to
-    # "running" before the encode starts so the cancel button can call
-    # compressor.cancel(job_id) at any time.
-    prep_event = btn.click(
-        fn=prepare_job,
-        outputs=[active_job],
-    ).then(
-        fn=lambda: (gr.update(visible=False), gr.update(visible=True), ""),
-        outputs=[btn, cancel_btn, result_md],
-    )
-    # Capture this dependency explicitly so cancels= targets the encode step.
-    # result_md is computed in a separate .then() (below) so Gradio doesn't
-    # paint a second progress overlay on it during the long compress.
-    compress_event = prep_event.then(
-        fn=processing_function,
-        inputs=[active_job, video_input, target_preset, target_custom, remove_audio, speed_mode, resolution, fps_mode, start_t, end_t],
-        outputs=video_output,
-    )
-    compress_event.then(
-        fn=make_result_message,
-        inputs=[video_output, video_input, target_preset, target_custom],
-        outputs=result_md,
-    ).then(
-        fn=lambda: (gr.update(visible=True), gr.update(visible=False), None),
-        outputs=[btn, cancel_btn, active_job],
-    )
-
-    cancel_btn.click(
-        fn=cancel_active_job,
-        inputs=[active_job],
-        outputs=[btn, cancel_btn, active_job, result_md],
-        cancels=[compress_event],
+with gr.Blocks(title="10mb video", delete_cache=(900, OUTPUT_TTL_SECONDS)) as demo:
+    gr.HTML(
+        html_template=_asset("compressor.html"),
+        css_template=_asset("compressor.css"),
+        js_on_load=_asset("compressor.js"),
+        head=(
+            '<link rel="preconnect" href="https://fonts.googleapis.com">'
+            '<link href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700'
+            '&display=swap" rel="stylesheet">'
+        ),
+        server_functions=[plan_job, start_job, job_status, cancel_job],
+        apply_default_css=False,
+        worker_src=_asset("encoder_worker.js"),
+        max_mb=MAX_INPUT_MB,
     )
 
 if __name__ == "__main__":
     # max_file_size rejects oversized uploads before they're transferred and
-    # written to disk; compressor's MAX_INPUT_BYTES check only ran afterwards.
+    # written to disk. allowed_paths lets the page download server results.
     demo.queue(max_size=8).launch(
         server_name="0.0.0.0", server_port=7860, inbrowser=True,
         max_file_size=f"{MAX_INPUT_MB}mb",
+        allowed_paths=[OUTPUT_DIR],
     )

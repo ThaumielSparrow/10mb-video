@@ -1,0 +1,54 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wc bench</title>
+<style>body { font: 14px system-ui, sans-serif; margin: 16px; } pre { white-space: pre-wrap; }</style>
+<p id="status">Running… keep this tab in the foreground (and the screen on, on a phone).</p>
+<pre id="out"></pre>
+<script type="module">
+import { runCase, log } from './lib.js';
+
+const out = document.getElementById('out');
+const say = (s) => { out.textContent += s + '\n'; };
+
+function gpuName() {
+  try {
+    const gl = document.createElement('canvas').getContext('webgl');
+    const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
+    return ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : null;
+  } catch { return null; }
+}
+
+(async () => {
+  let wakeLock = null;
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+  try {
+    await log({ env: { ua: navigator.userAgent, cores: navigator.hardwareConcurrency, mem_gb: navigator.deviceMemory ?? null, gpu: gpuName() } });
+    const cases = await (await fetch('/cases')).json();
+    say(`${cases.length} case(s): ${cases.map(c => c.name).join(', ')}`);
+
+    // Worker run first: that's the production shape (keeps the UI responsive).
+    say('worker: decode / decode+resize / convert / size-matched convert…');
+    const worker = new Worker('./worker.js', { type: 'module' });
+    await new Promise((resolve, reject) => {
+      worker.onmessage = resolve;
+      worker.onerror = (e) => reject(new Error('worker: ' + e.message));
+      worker.postMessage(cases);
+    });
+
+    say('main thread: convert…');
+    for (const c of cases.filter(c => !c.variant)) {
+      const blob = await (await fetch('/samples/' + encodeURIComponent(c.name))).blob();
+      await runCase(c, blob, ['convert']);
+    }
+  } catch (e) {
+    await log({ fatal: String((e && e.stack) || e) });
+    say('FAILED: ' + e);
+  }
+  wakeLock?.release?.();
+  await fetch('/done', { method: 'POST' });
+  document.getElementById('status').textContent = 'Done — you can close this tab.';
+  // Headless runs: closing the only tab lets the browser exit on its own.
+  if (navigator.webdriver || /Headless/.test(navigator.userAgent)) setTimeout(() => window.close(), 500);
+})();
+</script>

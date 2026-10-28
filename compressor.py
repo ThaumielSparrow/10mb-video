@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from utils import (
+    QUALITY_BPP_TARGET,
     available_cpus,
     compute_bitrate_plan,
     get_trim_bitrate,
@@ -74,7 +75,7 @@ def _resolve_target_fps(fps_mode, source_fps, source_width, source_height, video
     return pick_auto_fps_cap(source_fps, source_width, source_height, video_bitrate_bps, cap=_FPS_CAP)
 
 
-def _resolve_target_height(output_resolution, source_height, source_width, source_fps, video_bitrate_bps):
+def _resolve_target_height(output_resolution, source_height, source_width, source_fps, video_bitrate_bps, bpp_target=QUALITY_BPP_TARGET):
     """Translate the UI's output_resolution choice into a target short-side length.
 
     Callers pass the short side as source_height and the long side as
@@ -85,13 +86,94 @@ def _resolve_target_height(output_resolution, source_height, source_width, sourc
     if not source_height:
         return 0
     if output_resolution == "Auto":
-        picked = pick_auto_resolution(source_height, source_width, source_fps, video_bitrate_bps)
+        picked = pick_auto_resolution(source_height, source_width, source_fps, video_bitrate_bps, bpp_target)
         return picked if picked < source_height else 0
     if output_resolution in _RESOLUTION_HEIGHTS:
         height = _RESOLUTION_HEIGHTS[output_resolution]
         return height if height < source_height else 0
     # "Original" or anything unrecognised: no downscale.
     return 0
+
+
+def build_plan(meta, target_mb, remove_audio, start_time, end_time, output_resolution, fps_mode,
+               source_bitrate_cap=None, bpp_target=QUALITY_BPP_TARGET):
+    """Every encode decision for one job, made in one place.
+
+    The server pipeline (VideoCompressor) and the browser's on-device encoder
+    (via app.plan_job) both encode from this dict, so the summary the user sees,
+    the x264 encode and the WebCodecs encode can't drift apart. Raises
+    ValueError for an empty trim range or an impossible bitrate.
+
+    width/height in meta are display dimensions; resolution choices apply to
+    the short side so portrait phone video isn't squashed (e.g. to 270x480).
+    """
+    duration = meta["duration"]
+    s_time = max(float(start_time) if start_time else 0.0, 0.0)
+    e_time = min(float(end_time) if end_time else duration, duration)
+    clip_duration = e_time - s_time
+    if clip_duration <= 0:
+        raise ValueError("Invalid start/end time.")
+    is_trimmed = s_time > 0 or e_time < duration
+
+    passthrough, remux_ext = pick_passthrough(meta, target_mb, is_trimmed, remove_audio)
+    bitrates = compute_bitrate_plan(
+        target_mb=target_mb,
+        duration=clip_duration,
+        has_audio=meta["has_audio"],
+        remove_audio=remove_audio,
+        source_bitrate_cap=source_bitrate_cap or meta["bitrate"],
+    )
+    if bitrates is None:
+        raise ValueError("Invalid bitrate plan (check target and duration).")
+    video_bitrate, audio_bitrate = bitrates
+
+    source_width = meta.get("width") or 0
+    source_height = meta.get("height") or 0
+    source_short = min(source_width, source_height) if source_width else source_height
+    source_long = max(source_width, source_height)
+    source_fps = meta.get("fps") or 0
+
+    # Resolve fps cap first so resolution picker sees the post-cap effective
+    # fps. Order matters: capping fps doubles bits-per-frame, which means
+    # Auto resolution can keep a higher resolution than it would otherwise.
+    target_fps = _resolve_target_fps(fps_mode, source_fps, source_width, source_height, video_bitrate)
+    effective_fps = target_fps or source_fps
+
+    # "Auto" picks the height that gives decent quality at the chosen bitrate;
+    # "Original" leaves it alone; fixed presets ("720p" etc.) are honored
+    # as-is. We never upscale.
+    target_short = _resolve_target_height(
+        output_resolution, source_short, source_long, effective_fps, video_bitrate, bpp_target,
+    )
+    # What Auto would have picked, for the UI's "would look better" hint.
+    auto_short = pick_auto_resolution(source_short, source_long, effective_fps, video_bitrate, bpp_target)
+
+    # Exact output size, even on both axes (yuv420p). The server's ffmpeg scale
+    # derives the same thing from scale=-2:N; the browser encoder needs it spelled out.
+    out_short = (target_short or source_short) // 2 * 2
+    out_long = round(out_short * source_long / source_short / 2) * 2 if source_short else 0
+    portrait = source_width < source_height
+
+    keep_audio = meta["has_audio"] and not remove_audio
+    return {
+        "start": s_time,
+        "end": e_time,
+        "duration": clip_duration,
+        "is_trimmed": is_trimmed,
+        "passthrough": passthrough,
+        "remux_ext": remux_ext,
+        "video_bitrate": video_bitrate,
+        "audio_bitrate": audio_bitrate if keep_audio else 0,
+        "keep_audio": keep_audio,
+        "target_fps": target_fps,
+        "target_short": target_short,
+        "auto_short": auto_short,
+        "source_short": source_short,
+        "portrait": portrait,
+        "out_width": out_short if portrait else out_long,
+        "out_height": out_long if portrait else out_short,
+        "est_bytes": (video_bitrate + (audio_bitrate if keep_audio else 0)) * clip_duration / 8,
+    }
 
 
 _ERROR_HINTS = ("Error", "Invalid", "not found", "Conversion failed", "No such")
@@ -202,18 +284,13 @@ class VideoCompressor:
         if not meta:
             raise Exception("Could not read video metadata.")
 
-        s_time = float(start_time) if start_time else 0.0
-        e_time = float(end_time) if end_time else meta["duration"]
-        if s_time < 0: s_time = 0
-        if e_time > meta["duration"]: e_time = meta["duration"]
-
-        target_duration = e_time - s_time
-        if target_duration <= 0:
-            raise Exception("Invalid start/end time.")
-
-        is_trimmed = (s_time > 0 or e_time < meta["duration"])
-
-        passthrough, remux_ext = pick_passthrough(meta, target_mb, is_trimmed, remove_audio)
+        # First pass without the trim probe: it decides passthrough and the
+        # trim range, and passthrough never applies to a trimmed clip.
+        plan = build_plan(meta, target_mb, remove_audio, start_time, end_time, output_resolution, fps_mode)
+        s_time, e_time = plan["start"], plan["end"]
+        target_duration = plan["duration"]
+        is_trimmed = plan["is_trimmed"]
+        passthrough, remux_ext = plan["passthrough"], plan["remux_ext"]
         if passthrough == "unchanged":
             print("File is already below target size. Skipping encoding.")
             return input_path
@@ -234,53 +311,25 @@ class VideoCompressor:
             # Remux fails on streams the target container can't hold (e.g. PCM
             # audio into mp4); a real encode always works, so fall through.
 
-        source_bitrate_cap = meta["bitrate"]
         if is_trimmed:
             progress_callback(0, desc="Analyzing trimmed section...")
             trim_bitrate = get_trim_bitrate(input_path, s_time, e_time)
             if trim_bitrate:
-                source_bitrate_cap = trim_bitrate
                 print(f"Trim detected. Using local bitrate cap: {int(trim_bitrate/1024)}k (Global was {int(meta['bitrate']/1024)}k)")
+                plan = build_plan(meta, target_mb, remove_audio, start_time, end_time, output_resolution,
+                                  fps_mode, source_bitrate_cap=trim_bitrate)
 
-        plan = compute_bitrate_plan(
-            target_mb=target_mb,
-            duration=target_duration,
-            has_audio=meta["has_audio"],
-            remove_audio=remove_audio,
-            source_bitrate_cap=source_bitrate_cap,
-        )
-        if plan is None:
-            raise Exception("Invalid bitrate plan (check target and duration).")
-        video_bitrate, audio_bitrate = plan
-
-        keep_audio = meta["has_audio"] and not remove_audio
+        video_bitrate, audio_bitrate = plan["video_bitrate"], plan["audio_bitrate"]
+        keep_audio = plan["keep_audio"]
         if keep_audio:
             audio_args = ["-c:a", "aac", "-b:a", str(int(audio_bitrate))]
         else:
             audio_args = ["-an"]
 
-        # Resolve fps cap first so resolution picker sees the post-cap effective
-        # fps. Order matters: capping fps doubles bits-per-frame, which means
-        # Auto resolution can keep a higher resolution than it would otherwise.
-        # width/height are display dimensions (rotation applied); resolution
-        # choices apply to the short side so portrait phone video isn't
-        # squashed to e.g. 270x480.
-        source_width = meta.get("width") or 0
-        source_height = meta.get("height") or 0
-        source_short = min(source_width, source_height) if source_width else source_height
-        source_long = max(source_width, source_height)
-        source_fps = meta.get("fps") or 0
-        target_fps = _resolve_target_fps(
-            fps_mode, source_fps, source_width, source_height, video_bitrate,
-        )
-        effective_fps = target_fps if target_fps else source_fps
-
-        # Resolve output resolution. "Auto" picks the height that gives decent
-        # quality at the chosen bitrate; "Original" leaves it alone; fixed
-        # presets ("720p" etc.) are honored as-is. We never upscale.
-        target_short = _resolve_target_height(
-            output_resolution, source_short, source_long, effective_fps, video_bitrate,
-        )
+        source_short = plan["source_short"]
+        source_long = max(meta.get("width") or 0, meta.get("height") or 0)
+        target_fps, target_short = plan["target_fps"], plan["target_short"]
+        effective_fps = target_fps or meta.get("fps") or 0
 
         # fps before scale: dropping 60->30 first halves the frames the scaler
         # touches. format=yuv420p forces 8-bit 4:2:0: a 10-bit source (iPhone
@@ -290,7 +339,7 @@ class VideoCompressor:
         if target_fps:
             vf_parts.append(f"fps={target_fps}")
         if target_short:
-            if source_width < source_height:
+            if plan["portrait"]:
                 vf_parts.append(f"scale={target_short}:-2")
             else:
                 vf_parts.append(f"scale=-2:{target_short}")

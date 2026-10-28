@@ -1,0 +1,112 @@
+<section class="tm" data-stage="empty">
+  <header class="tm-head">
+    <h1>Shrink a video to fit an upload limit</h1>
+    <p>Pick a clip and a size limit. Fast mode compresses on your device, so nothing gets uploaded.</p>
+  </header>
+
+  <!-- Kept outside the picker (which hides once a file is chosen) so the
+       Change button can still open it; some Safari versions ignore click() on
+       inputs inside display:none. -->
+  <input type="file" id="tm-file" class="tm-file" accept="video/*,.mkv,.mov,.mp4,.webm,.m4v">
+  <label class="tm-pick" for="tm-file">
+    <span class="tm-pick-main">Choose a video</span>
+    <span class="tm-pick-sub">or drop one here</span>
+  </label>
+
+  <div class="tm-source" hidden>
+    <div class="tm-source-text">
+      <p class="tm-source-name"></p>
+      <p class="tm-source-facts"></p>
+    </div>
+    <button type="button" class="tm-change">Change</button>
+  </div>
+
+  <figure class="tm-tape" hidden>
+    <div class="tm-strip">
+      <div class="tm-ticks"></div>
+      <div class="tm-fill"></div>
+      <div class="tm-src-mark"><span></span></div>
+      <div class="tm-cap"><span></span></div>
+    </div>
+    <figcaption class="tm-tape-note"></figcaption>
+  </figure>
+
+  <div class="tm-controls">
+    <fieldset class="tm-target">
+      <legend>Size limit</legend>
+      <div class="tm-chips">
+        <label><input type="radio" name="tm-target" value="8"><span>8 MB</span></label>
+        <label><input type="radio" name="tm-target" value="10" checked><span>10 MB</span></label>
+        <label><input type="radio" name="tm-target" value="25"><span>25 MB</span></label>
+        <label><input type="radio" name="tm-target" value="50"><span>50 MB</span></label>
+        <label><input type="radio" name="tm-target" value="custom"><span>Other</span></label>
+      </div>
+      <label class="tm-custom" hidden>
+        <span>Limit in MB</span>
+        <input type="number" class="tm-custom-mb" min="1" max="2000" step="0.5" value="15" inputmode="decimal">
+      </label>
+    </fieldset>
+
+    <fieldset class="tm-mode">
+      <legend>Speed</legend>
+      <div class="tm-chips">
+        <label><input type="radio" name="tm-mode" value="fast" checked><span>Fast</span></label>
+        <label><input type="radio" name="tm-mode" value="quality"><span>Best quality</span></label>
+      </div>
+      <p class="tm-mode-hint"></p>
+    </fieldset>
+
+    <details class="tm-more">
+      <summary>More options</summary>
+      <div class="tm-more-grid">
+        <label>
+          <span>Resolution</span>
+          <select class="tm-res">
+            <option value="Auto" selected>Auto</option>
+            <option value="Original">Original</option>
+            <option value="720p">720p</option>
+            <option value="480p">480p</option>
+            <option value="360p">360p</option>
+          </select>
+        </label>
+        <label>
+          <span>Frame rate</span>
+          <select class="tm-fps">
+            <option value="Auto" selected>Auto</option>
+            <option value="On">Cap at 30 fps</option>
+            <option value="Off">Keep original</option>
+          </select>
+        </label>
+        <label>
+          <span>Start (seconds)</span>
+          <input type="number" class="tm-start" min="0" step="0.1" value="0" inputmode="decimal">
+        </label>
+        <label>
+          <span>End (seconds)</span>
+          <input type="number" class="tm-end" min="0" step="0.1" placeholder="End of clip" inputmode="decimal">
+        </label>
+        <label class="tm-check">
+          <input type="checkbox" class="tm-noaudio">
+          <span>Remove audio</span>
+        </label>
+      </div>
+    </details>
+  </div>
+
+  <p class="tm-summary"></p>
+
+  <div class="tm-actions">
+    <button type="button" class="tm-go" disabled>Compress</button>
+    <button type="button" class="tm-cancel" hidden>Cancel</button>
+  </div>
+  <p class="tm-status" aria-live="polite"></p>
+
+  <section class="tm-result" hidden>
+    <video class="tm-video" controls playsinline preload="auto"></video>
+    <p class="tm-result-line"></p>
+    <div class="tm-result-actions">
+      <a class="tm-download" download>Download</a>
+      <button type="button" class="tm-share" hidden>Share</button>
+    </div>
+  </section>
+</section>
