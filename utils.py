@@ -1,6 +1,54 @@
+import math
+import re
 import subprocess
 import json
 import os
+
+
+def available_cpus(default=2):
+    """CPUs this container may actually use, for ffmpeg's -threads.
+
+    Inside a CFS-quota container (HF Spaces), os.cpu_count() and ffmpeg's own
+    auto-detect both report the *host's* cores, so "auto" threading spawns far
+    more threads than the 2 vCPUs we get. FFMPEG_THREADS overrides; otherwise
+    use the cgroup v2/v1 quota; otherwise `default` (HF cpu-basic's 2 vCPUs).
+    """
+    env = os.environ.get("FFMPEG_THREADS", "")
+    if env.isdigit() and int(env) > 0:
+        return int(env)
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().split()[:2]
+        if quota != "max":
+            return max(1, math.ceil(int(quota) / int(period)))
+    except (OSError, ValueError):
+        pass
+    try:
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as f:
+            quota = int(f.read())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as f:
+            period = int(f.read())
+        if quota > 0 and period > 0:
+            return max(1, math.ceil(quota / period))
+    except (OSError, ValueError):
+        pass
+    return default
+
+
+def _rotation(stream):
+    """Display rotation in degrees from the display-matrix side data (or the
+    legacy 'rotate' tag older muxers wrote). Phones record portrait video as
+    landscape frames plus a 90/-90 rotation, which ffmpeg applies on decode."""
+    for side_data in stream.get("side_data_list") or []:
+        if "rotation" in side_data:
+            try:
+                return int(float(side_data["rotation"]))
+            except (TypeError, ValueError):
+                return 0
+    try:
+        return int((stream.get("tags") or {}).get("rotate", 0))
+    except (TypeError, ValueError):
+        return 0
 
 def _parse_fps(value):
     """Parse ffprobe's avg_frame_rate ('30000/1001', '30/1', '24') into float."""
@@ -21,13 +69,19 @@ def _parse_fps(value):
 def get_video_metadata(input_path):
     """
     Returns a dictionary containing duration, audio presence,
-    original bitrate, file size, the video stream's width/height, and fps.
+    original bitrate, file size, the video stream's codec, width/height, and
+    fps, plus the file extension.
+
+    width/height are *display* dimensions (rotation applied), because ffmpeg
+    autorotates on decode — every filter we build sees the rotated frame.
     """
     try:
         cmd = [
             "ffprobe",
             "-v", "error",
-            "-show_entries", "format=duration,size,bit_rate:stream=codec_type,width,height,avg_frame_rate",
+            "-show_entries", "format=duration,size,bit_rate"
+            ":stream=codec_type,codec_name,width,height,avg_frame_rate"
+            ":stream_side_data=rotation:stream_tags=rotate",
             "-of", "json",
             input_path
         ]
@@ -44,6 +98,8 @@ def get_video_metadata(input_path):
         width = video_stream.get("width") if video_stream else None
         height = video_stream.get("height") if video_stream else None
         fps = _parse_fps(video_stream.get("avg_frame_rate")) if video_stream else None
+        if video_stream and abs(_rotation(video_stream)) % 180 == 90:
+            width, height = height, width
 
         if "bit_rate" in fmt and fmt["bit_rate"] != "N/A":
             bitrate = float(fmt["bit_rate"])
@@ -55,6 +111,8 @@ def get_video_metadata(input_path):
             "size_bytes": size_bytes,
             "bitrate": bitrate,
             "has_audio": has_audio,
+            "video_codec": video_stream.get("codec_name") if video_stream else None,
+            "container_ext": os.path.splitext(input_path)[1].lower(),
             "width": width,
             "height": height,
             "fps": fps,
@@ -149,50 +207,49 @@ def pick_auto_fps_cap(source_fps, source_width, source_height, video_bitrate_bps
     return cap if bpp < QUALITY_BPP_TARGET / 2 else 0
 
 
-def get_trim_bitrate(input_path, start, end, work_dir):
+# Final stats line ffmpeg prints after a run, e.g. (5.1) "video:77986kB audio:591kB
+# subtitle:0kB other streams:0kB ..." or (7.x+) the same with "KiB". Both are 1024-byte units.
+_STREAM_SIZES_RE = re.compile(
+    r"video:\s*(\d+)\s*Ki?B\s+audio:\s*(\d+)\s*Ki?B\s+subtitle:\s*(\d+)\s*Ki?B"
+    r"\s+other streams:\s*(\d+)\s*Ki?B",
+    re.IGNORECASE,
+)
+
+
+def get_trim_bitrate(input_path, start, end):
     """
-    Performs a temporary Stream Copy trim to measure the EXACT bitrate
+    Performs a Stream Copy trim to measure the EXACT bitrate
     of the specific section the user selected.
     This prevents inflating a simple scene (like a black screen) to a high bitrate.
 
-    work_dir must be a per-job directory so concurrent calls don't clobber each other.
-
-    Bitrate is computed from the trimmed file's size and the requested duration
-    (size * 8 / duration). This is an approximation — file size includes container
-    overhead — but well within the precision needed to drive the size cap, and
-    saves a redundant ffprobe call.
+    The copy goes to ffmpeg's null muxer and we read the per-stream byte totals
+    from its final stats line, so nothing is written to disk — the old temp-file
+    approach wrote up to the whole (500 MB) source to the Space's disk per trim.
     """
-    temp_check_file = os.path.join(work_dir, "temp_bitrate_check.mp4")
     duration = float(end) - float(start)
     if duration <= 0:
         return None
 
     try:
         cmd = [
-            "ffmpeg", "-y",
+            "ffmpeg", "-nostdin", "-hide_banner", "-nostats",
             "-ss", str(start),
             "-to", str(end),
             "-i", input_path,
             "-c", "copy",
             "-map", "0",
-            "-avoid_negative_ts", "make_zero",
-            temp_check_file
+            "-f", "null", "-",
         ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-
-        if not os.path.exists(temp_check_file):
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, check=True)
+        matches = _STREAM_SIZES_RE.findall(result.stderr)
+        if not matches:
             return None
-        size_bytes = os.path.getsize(temp_check_file)
-        return (size_bytes * 8) / duration
+        size_bytes = sum(int(kib) for kib in matches[-1]) * 1024
+        return (size_bytes * 8) / duration if size_bytes else None
 
     except Exception:
         return None
-    finally:
-        if os.path.exists(temp_check_file):
-            try:
-                os.remove(temp_check_file)
-            except OSError:
-                pass
+
 
 def compute_bitrate_plan(target_mb, duration, has_audio, remove_audio, source_bitrate_cap):
     """
@@ -224,6 +281,38 @@ def compute_bitrate_plan(target_mb, duration, has_audio, remove_audio, source_bi
         video_bitrate = 10000
 
     return video_bitrate, audio_bitrate
+
+
+# (container, video codec) pairs gr.Video treats as browser-playable — mirrors
+# gradio.processing_utils.video_is_playable. Any other file handed to the output
+# component gets silently re-encoded by Gradio (libx264 CRF 23, unthrottled
+# threads, ignoring our size target), so we never return one.
+_BROWSER_PLAYABLE = {
+    (".mp4", "h264"), (".mp4", "av1"),
+    (".webm", "vp9"), (".webm", "vp8"), (".webm", "av1"),
+    (".ogg", "theora"),
+}
+# Codecs that can be stream-copied into .mp4 and still pass the check above.
+_MP4_REMUXABLE = {"h264", "av1"}
+
+
+def pick_passthrough(meta, target_mb, is_trimmed, remove_audio):
+    """Decide whether a source already under target can skip re-encoding.
+
+    Returns (mode, ext): ("unchanged", None) to hand the source back as-is,
+    ("remux", ext) to stream-copy it into a new file with extension ext
+    (dropping audio if asked), or (None, None) when it needs a real encode.
+    """
+    if not meta or is_trimmed or target_mb is None:
+        return None, None
+    if meta["size_bytes"] >= target_mb * 1024 * 1024:
+        return None, None
+    ext, codec = meta.get("container_ext"), meta.get("video_codec")
+    if (ext, codec) in _BROWSER_PLAYABLE:
+        return ("remux", ext) if remove_audio else ("unchanged", None)
+    if codec in _MP4_REMUXABLE:
+        return "remux", ".mp4"
+    return None, None
 
 
 def estimate_video_bitrate(meta, target_mb, remove_audio, duration):

@@ -7,11 +7,13 @@ import threading
 import time
 import uuid
 from utils import (
+    available_cpus,
     compute_bitrate_plan,
     get_trim_bitrate,
     get_video_metadata,
     pick_auto_fps_cap,
     pick_auto_resolution,
+    pick_passthrough,
 )
 
 # Encode artifacts live in the platform tempdir so the working directory stays
@@ -30,6 +32,23 @@ OUTPUT_TTL_SECONDS = 3600
 MAX_INPUT_MB = 500
 MAX_INPUT_BYTES = MAX_INPUT_MB * 1024 * 1024
 
+# Thread count for every ffmpeg stage (decoder, filters, x264). Left on "auto",
+# ffmpeg sizes its decoder/filter pools from the *host's* core count, not the
+# Space's 2-vCPU quota. See utils.available_cpus.
+THREADS = str(available_cpus())
+print(f"ffmpeg threads: {THREADS}")
+
+# Decode-once: when we downscale or drop frames, pass 1 also writes its filtered
+# frames to a lossless ffvhuff intermediate, and pass 2 encodes from that instead
+# of decoding + scaling the full-res source a second time. On 2 vCPUs decode+scale
+# is most of a superfast encode, so this cut a 60s 1080p60 H.264 job from 55.0s
+# to 38.6s and a 30s 1080p60 HEVC job from 28.7s to 19.8s, with identical frames
+# going into x264. ffvhuff came out ~1/3 of raw yuv420p on noisy footage; budget
+# it at 1/2 and fall back to two full decodes when it wouldn't fit.
+INTERMEDIATE_RATIO = 0.5
+INTERMEDIATE_MAX_BYTES = 3 * 1024 ** 3
+
+_FFMPEG = ["ffmpeg", "-nostdin", "-hide_banner"]
 
 _RESOLUTION_HEIGHTS = {"720p": 720, "480p": 480, "360p": 360}
 
@@ -56,8 +75,10 @@ def _resolve_target_fps(fps_mode, source_fps, source_width, source_height, video
 
 
 def _resolve_target_height(output_resolution, source_height, source_width, source_fps, video_bitrate_bps):
-    """Translate the UI's output_resolution choice into an ffmpeg target height.
+    """Translate the UI's output_resolution choice into a target short-side length.
 
+    Callers pass the short side as source_height and the long side as
+    source_width, so "720p" means 720 on the short side for portrait video too.
     Returns 0 when no scale filter should be applied (Original, or when the
     requested height equals/exceeds source).
     """
@@ -192,20 +213,31 @@ class VideoCompressor:
 
         is_trimmed = (s_time > 0 or e_time < meta["duration"])
 
-        target_bytes_strict = target_mb * 1024 * 1024
-        if (meta["size_bytes"] < target_bytes_strict) and not is_trimmed and not remove_audio:
+        passthrough, remux_ext = pick_passthrough(meta, target_mb, is_trimmed, remove_audio)
+        if passthrough == "unchanged":
             print("File is already below target size. Skipping encoding.")
             return input_path
 
-        # Per-request working directory keeps output, two-pass logs, and the trim
-        # probe file isolated from concurrent jobs sharing the same Space.
+        # Per-request working directory keeps output, two-pass logs, and the
+        # intermediate isolated from concurrent jobs sharing the same Space.
         job_dir = os.path.join(self.output_dir, job_id)
         os.makedirs(job_dir, exist_ok=True)
+        base_name = os.path.splitext(os.path.basename(input_path))[0]
+
+        if passthrough == "remux":
+            remuxed = self._try_remux(
+                job_id, input_path, os.path.join(job_dir, f"{base_name}_compressed{remux_ext}"),
+                remove_audio, meta["duration"], target_mb * 1024 * 1024, progress_callback,
+            )
+            if remuxed:
+                return remuxed
+            # Remux fails on streams the target container can't hold (e.g. PCM
+            # audio into mp4); a real encode always works, so fall through.
 
         source_bitrate_cap = meta["bitrate"]
         if is_trimmed:
             progress_callback(0, desc="Analyzing trimmed section...")
-            trim_bitrate = get_trim_bitrate(input_path, s_time, e_time, job_dir)
+            trim_bitrate = get_trim_bitrate(input_path, s_time, e_time)
             if trim_bitrate:
                 source_bitrate_cap = trim_bitrate
                 print(f"Trim detected. Using local bitrate cap: {int(trim_bitrate/1024)}k (Global was {int(meta['bitrate']/1024)}k)")
@@ -221,16 +253,22 @@ class VideoCompressor:
             raise Exception("Invalid bitrate plan (check target and duration).")
         video_bitrate, audio_bitrate = plan
 
-        if remove_audio or not meta["has_audio"]:
-            audio_args = ["-an"]
-        else:
+        keep_audio = meta["has_audio"] and not remove_audio
+        if keep_audio:
             audio_args = ["-c:a", "aac", "-b:a", str(int(audio_bitrate))]
+        else:
+            audio_args = ["-an"]
 
         # Resolve fps cap first so resolution picker sees the post-cap effective
         # fps. Order matters: capping fps doubles bits-per-frame, which means
         # Auto resolution can keep a higher resolution than it would otherwise.
-        source_height = meta.get("height") or 0
+        # width/height are display dimensions (rotation applied); resolution
+        # choices apply to the short side so portrait phone video isn't
+        # squashed to e.g. 270x480.
         source_width = meta.get("width") or 0
+        source_height = meta.get("height") or 0
+        source_short = min(source_width, source_height) if source_width else source_height
+        source_long = max(source_width, source_height)
         source_fps = meta.get("fps") or 0
         target_fps = _resolve_target_fps(
             fps_mode, source_fps, source_width, source_height, video_bitrate,
@@ -240,38 +278,45 @@ class VideoCompressor:
         # Resolve output resolution. "Auto" picks the height that gives decent
         # quality at the chosen bitrate; "Original" leaves it alone; fixed
         # presets ("720p" etc.) are honored as-is. We never upscale.
-        target_height = _resolve_target_height(
-            output_resolution, source_height, source_width, effective_fps, video_bitrate,
+        target_short = _resolve_target_height(
+            output_resolution, source_short, source_long, effective_fps, video_bitrate,
         )
 
+        # fps before scale: dropping 60->30 first halves the frames the scaler
+        # touches. format=yuv420p forces 8-bit 4:2:0: a 10-bit source (iPhone
+        # HDR HEVC) otherwise comes out as H.264 High 10, which browsers and
+        # Discord won't play and Gradio's playability check doesn't catch.
         vf_parts = []
-        if target_height and target_height < source_height:
-            vf_parts.append(f"scale=-2:{target_height}")
         if target_fps:
             vf_parts.append(f"fps={target_fps}")
-        scale_args = ["-vf", ",".join(vf_parts)] if vf_parts else []
+        if target_short:
+            if source_width < source_height:
+                vf_parts.append(f"scale={target_short}:-2")
+            else:
+                vf_parts.append(f"scale=-2:{target_short}")
+        vf_parts.append("format=yuv420p")
+        vf = ",".join(vf_parts)
 
-        base_name = os.path.splitext(os.path.basename(input_path))[0]
         output_path = os.path.join(job_dir, f"{base_name}_compressed.mp4")
 
-        trim_args = ["-ss", str(s_time), "-to", str(e_time)] if is_trimmed else []
+        # Input-side seek (-ss/-t before -i): ffmpeg jumps to the keyframe before
+        # the trim start and decodes from there, still frame-accurate. Output-side
+        # -ss decoded and discarded everything before the trim start on both
+        # passes (trimming 40-50s of a 60s clip: 38s -> 12s).
+        trim_args = ["-ss", str(s_time), "-t", str(target_duration)] if is_trimmed else []
+        source_input = ["-threads", THREADS, *trim_args, "-i", input_path]
         v_bitrate_str = str(int(video_bitrate))
 
-        # -threads matches the HF Spaces Free tier vCPU count; libx264's auto-detect
-        # can over-subscribe on shared infra and slow encoding down.
         # NOTE: two-pass *requires* the same -preset on both passes. A pass-1
         # preset that strips features (e.g. ultrafast disables mbtree/cabac)
         # produces a stats file that pass 2 refuses to consume ("Could not open
         # encoder before EOF" / EINVAL). libx264 already optimizes pass 1
         # internally via --slow-firstpass=0 (the default), so don't try to
         # speed it up further by overriding the preset.
-        common_args = [
-            "-y",
-            *trim_args,
-            *scale_args,
+        x264_args = [
             "-c:v", "libx264",
             "-preset", ffmpeg_preset,
-            "-threads", "2",
+            "-threads", THREADS,
             "-b:v", v_bitrate_str,
             "-maxrate", str(int(video_bitrate * 1.5)),
             "-bufsize", str(int(video_bitrate * 2)),
@@ -285,37 +330,120 @@ class VideoCompressor:
         # when we switch to two-pass at the same superfast preset).
         pass_log_prefix = os.path.join(job_dir, "ffmpeg2pass")
         pass_args = ["-passlogfile", pass_log_prefix]
+        # -sn/-dn: never carry subtitle/data streams into mp4 (bitmap subs can't
+        # be converted and would fail the whole encode). +faststart puts the
+        # moov atom up front so the result plays before it fully downloads.
+        out_args = ["-sn", "-dn", "-movflags", "+faststart"]
 
-        cmd_pass1 = [
-            "ffmpeg", "-i", input_path,
-            *common_args,
-            *pass_args,
-            "-pass", "1",
-            "-an",
-            "-f", "mp4", os.devnull
-        ]
-        self._run_ffmpeg_with_progress(
-            job_id, cmd_pass1, progress_callback, target_duration,
-            progress_start=0.0, progress_end=0.25,
-            description="Analyzing metadata..."
-        )
+        intermediate_path = None
+        if target_fps or target_short:
+            intermediate_path = self._plan_intermediate(
+                job_dir, source_short, source_long, target_short, effective_fps, target_duration,
+            )
 
-        cmd_pass2 = [
-            "ffmpeg", "-i", input_path,
-            *common_args,
-            *pass_args,
-            "-pass", "2",
-            *audio_args,
-            output_path
-        ]
-        self._run_ffmpeg_with_progress(
-            job_id, cmd_pass2, progress_callback, target_duration,
-            progress_start=0.25, progress_end=1.0,
-            description="Compressing..."
-        )
-        self._cleanup_logs(pass_log_prefix)
+        if intermediate_path:
+            cmd_pass1 = [
+                *_FFMPEG, "-y", *source_input,
+                "-filter_complex_threads", THREADS,
+                "-filter_complex", f"[0:v]{vf},split=2[enc][keep]",
+                "-map", "[enc]", *x264_args, *pass_args, "-pass", "1", "-f", "null", "-",
+                "-map", "[keep]", "-c:v", "ffvhuff", "-threads", "1", intermediate_path,
+            ]
+            # Video from the (already trimmed + filtered) intermediate; audio
+            # straight from the source with the same input-side trim.
+            if keep_audio:
+                pass2_inputs = ["-i", intermediate_path, *trim_args, "-i", input_path,
+                                "-map", "0:v:0", "-map", "1:a:0"]
+            else:
+                pass2_inputs = ["-i", intermediate_path]
+            cmd_pass2 = [
+                *_FFMPEG, "-y", "-threads", THREADS, *pass2_inputs,
+                *x264_args, *pass_args, "-pass", "2",
+                *audio_args, *out_args, output_path,
+            ]
+            # Pass 1 now carries the whole decode + scale; pass 2 is mostly x264.
+            pass1_share = 0.75 if ffmpeg_preset == "superfast" else 0.5
+        else:
+            filter_args = ["-filter_threads", THREADS, "-vf", vf]
+            cmd_pass1 = [
+                *_FFMPEG, "-y", *source_input, *filter_args,
+                *x264_args, *pass_args, "-pass", "1",
+                "-an", "-sn", "-dn", "-f", "null", "-",
+            ]
+            cmd_pass2 = [
+                *_FFMPEG, "-y", *source_input, *filter_args,
+                *x264_args, *pass_args, "-pass", "2",
+                *audio_args, *out_args, output_path,
+            ]
+            pass1_share = 0.45 if ffmpeg_preset == "superfast" else 0.25
+
+        try:
+            self._run_ffmpeg_with_progress(
+                job_id, cmd_pass1, progress_callback, target_duration,
+                progress_start=0.0, progress_end=pass1_share,
+                description="Analyzing (pass 1 of 2)..."
+            )
+            self._run_ffmpeg_with_progress(
+                job_id, cmd_pass2, progress_callback, target_duration,
+                progress_start=pass1_share, progress_end=1.0,
+                description="Compressing (pass 2 of 2)..."
+            )
+        finally:
+            # Don't leave a multi-GB intermediate on the Space's disk until the
+            # TTL prune when the encode fails or is cancelled.
+            if intermediate_path and os.path.exists(intermediate_path):
+                try:
+                    os.remove(intermediate_path)
+                except OSError:
+                    pass
+            self._cleanup_logs(pass_log_prefix)
 
         return output_path
+
+    def _plan_intermediate(self, job_dir, source_short, source_long, target_short, fps, duration):
+        """Path for the decode-once intermediate, or None when its estimated size
+        exceeds INTERMEDIATE_MAX_BYTES or half the free disk."""
+        if not source_short or not source_long or not fps:
+            return None
+        out_short = target_short or source_short
+        out_long = out_short * source_long / source_short
+        estimate = out_short * out_long * 1.5 * fps * duration * INTERMEDIATE_RATIO  # yuv420p
+        try:
+            free = shutil.disk_usage(job_dir).free
+        except OSError:
+            return None
+        if estimate > min(INTERMEDIATE_MAX_BYTES, free / 2):
+            return None
+        return os.path.join(job_dir, "intermediate.nut")
+
+    def _try_remux(self, job_id, input_path, output_path, remove_audio, duration, max_bytes, progress_callback):
+        """Stream-copy a source that's already under target into a browser-playable
+        container (dropping audio if asked). Returns output_path, or None when
+        ffmpeg can't do it or the result isn't under max_bytes."""
+        cmd = [
+            *_FFMPEG, "-y", "-i", input_path,
+            "-c", "copy", "-sn", "-dn",
+            *(["-an"] if remove_audio else []),
+            *(["-movflags", "+faststart"] if output_path.endswith(".mp4") else []),
+            output_path,
+        ]
+        try:
+            self._run_ffmpeg_with_progress(
+                job_id, cmd, progress_callback, duration,
+                progress_start=0.0, progress_end=1.0,
+                description="Repackaging without re-encoding..."
+            )
+        except CompressionCancelled:
+            raise
+        except Exception as e:
+            print(f"Remux failed, falling back to a full encode: {e}")
+            return None
+        try:
+            if os.path.getsize(output_path) < max_bytes:
+                return output_path
+        except OSError:
+            pass
+        return None
 
     def _run_ffmpeg_with_progress(self, job_id, cmd, progress_callback, total_duration, progress_start, progress_end, description):
         process = subprocess.Popen(

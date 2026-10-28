@@ -2,13 +2,14 @@ import os
 import uuid
 
 import gradio as gr
-from compressor import CompressionCancelled, VideoCompressor
+from compressor import MAX_INPUT_MB, OUTPUT_TTL_SECONDS, CompressionCancelled, VideoCompressor
 from utils import (
     compute_bitrate_plan,
     estimate_video_bitrate,
     get_video_metadata,
     pick_auto_fps_cap,
     pick_auto_resolution,
+    pick_passthrough,
 )
 
 compressor = VideoCompressor()
@@ -162,11 +163,18 @@ def _format_summary(meta, preset, custom_mb, remove_audio, output_resolution, fp
     if target_mb is None:
         return "\n\n".join(lines)
 
-    source_under_target = meta["size_bytes"] < target_mb * 1024 * 1024
-    if source_under_target and not is_trimmed and not remove_audio:
+    passthrough, _ = pick_passthrough(meta, target_mb, is_trimmed, remove_audio)
+    if passthrough == "unchanged":
         lines.append(
             f"**Source is already under {target_mb:g} MB** &mdash; Compress will return "
             "the original file unchanged."
+        )
+        return "\n\n".join(lines)
+    if passthrough == "remux":
+        action = "drop the audio track" if remove_audio else "repackage it as MP4"
+        lines.append(
+            f"**Source is already under {target_mb:g} MB** &mdash; Compress will "
+            f"{action} without re-encoding."
         )
         return "\n\n".join(lines)
 
@@ -201,6 +209,11 @@ def _format_summary(meta, preset, custom_mb, remove_audio, output_resolution, fp
     # a higher resolution).
     fps_cap = _resolve_fps_cap(fps_mode, source_fps, source_width, source_height, bitrate)
     effective_fps = fps_cap if fps_cap else source_fps
+
+    # Resolutions name the short side ("720p" portrait = 720x1280), matching
+    # compressor; from here on source_height/width mean short/long side.
+    if source_width:
+        source_height, source_width = min(source_width, source_height), max(source_width, source_height)
 
     if source_height:
         effective_h = _effective_height(output_resolution, source_height, source_width, effective_fps, bitrate)
@@ -265,7 +278,10 @@ def on_preset_change(preset):
     return gr.update(visible=(preset == "Custom"))
 
 
-with gr.Blocks(title="Smart Video Compressor") as demo:
+# Gradio keeps every upload (up to MAX_INPUT_MB each) and a copy of every result
+# in its own cache forever by default; sweep it on the same TTL as our outputs
+# so a busy Space doesn't fill its disk.
+with gr.Blocks(title="Smart Video Compressor", delete_cache=(900, OUTPUT_TTL_SECONDS)) as demo:
     gr.Markdown("# 📼 Smart Video Compressor")
     gr.Markdown("Compress videos to a specific size, inspired by 8mb.video.")
 
@@ -402,4 +418,9 @@ with gr.Blocks(title="Smart Video Compressor") as demo:
     )
 
 if __name__ == "__main__":
-    demo.queue(max_size=8).launch(server_name="0.0.0.0", server_port=7860, inbrowser=True)
+    # max_file_size rejects oversized uploads before they're transferred and
+    # written to disk; compressor's MAX_INPUT_BYTES check only ran afterwards.
+    demo.queue(max_size=8).launch(
+        server_name="0.0.0.0", server_port=7860, inbrowser=True,
+        max_file_size=f"{MAX_INPUT_MB}mb",
+    )
