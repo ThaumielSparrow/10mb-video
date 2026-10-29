@@ -178,25 +178,25 @@
 .tm-chips input:focus-visible + span { outline: 3px solid var(--tm-tape); outline-offset: 2px; }
 .tm-chips input:disabled + span { opacity: 0.5; cursor: default; }
 .tm-mode-hint { margin: 8px 0 0; color: var(--tm-muted); font-size: 0.95rem; }
-.tm-custom { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.tm-custom { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-weight: 600; }
 
 .tm-more summary { cursor: pointer; margin: 0; width: fit-content; }
 .tm-more[open] summary { margin-bottom: 12px; }
-.tm-more-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px 16px; }
+/* Fields size to their content and wrap, rather than stretching to fill columns. */
+.tm-more-grid { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px 20px; }
 .tm-more-grid label { display: grid; gap: 4px; font-size: 0.95rem; color: var(--tm-muted); }
-.tm-more-grid .tm-check { display: flex; align-items: center; gap: 10px; color: var(--tm-text); }
+.tm-more-grid .tm-check { display: flex; align-items: center; gap: 10px; min-height: 40px; color: var(--tm-text); }
 .tm select, .tm input[type="number"] {
   font: inherit;
   color: var(--tm-text);
   background: var(--tm-surface);
   border: 1.5px solid var(--tm-line);
   border-radius: 8px;
-  padding: 8px 10px;
-  min-height: 42px;
-  width: 100%;
+  padding: 7px 10px;
+  min-height: 40px;
   box-sizing: border-box;
 }
-.tm-custom input { width: 7em; }
+.tm input[type="number"] { width: 6.5em; }
 .tm-check input { width: 20px; height: 20px; accent-color: var(--tm-text); }
 .tm select:focus-visible, .tm input:focus-visible, .tm button:focus-visible, .tm a:focus-visible {
   outline: 3px solid var(--tm-tape);

@@ -58,7 +58,7 @@
     const [duration, track, audioTrack] = await Promise.all([
       input.computeDuration(), input.getPrimaryVideoTrack(), input.getPrimaryAudioTrack(),
     ]);
-    if (!track) throw new Error('No video track found in this file.');
+    if (!track) throw new Error('No video track found.');
     const [codec, width, height, stats] = await Promise.all([
       track.getCodec(), track.getDisplayWidth(), track.getDisplayHeight(), track.computePacketStats(120),
     ]);
@@ -81,10 +81,10 @@
   }
 
   async function deviceBlocker(plan) {
-    if (!('VideoEncoder' in self) || !('Worker' in self)) return "This browser can't encode video";
-    if (!state.track) return "This browser can't read this file";
+    if (!('VideoEncoder' in self) || !('Worker' in self)) return "Browser can't encode video";
+    if (!state.track) return "Browser can't read this file";
     if (plan.passthrough === 'remux') return null; // stream copy: nothing to decode or encode
-    if (!(await state.track.canDecode())) return `This browser can't decode ${state.meta.video_codec || 'this'} video`;
+    if (!(await state.track.canDecode())) return `Browser can't decode ${state.meta.video_codec || 'this'} video`;
     const fps = plan.target_fps || state.meta.fps || 30;
     try {
       const support = await VideoEncoder.isConfigSupported({
@@ -95,14 +95,14 @@
       });
       // Software-only encoders were no faster than hardware in testing and
       // clearly worse than the server's x264, so they don't qualify.
-      if (!support.supported) return 'This device has no hardware video encoder the browser can use';
+      if (!support.supported) return 'No hardware encoder found';
     } catch {
-      return "This browser can't encode video";
+      return "Browser can't encode video";
     }
     if (plan.keep_audio) {
       const m = await mediabunny();
       if (!state.audioTrack || !(await state.audioTrack.canDecode()) || !(await m.canEncodeAudio('aac'))) {
-        return "This browser can't encode AAC audio";
+        return "Browser can't encode AAC audio";
       }
     }
     return null;
@@ -112,13 +112,13 @@
   let planSeq = 0;
   async function replan() {
     renderTarget();
-    if (!state.file) return;
+    if (!state.file) { render(); return; }
     const seq = ++planSeq;
     const s = settings();
     if (!state.meta) {
       state.plan = null;
       state.path = 'server';
-      state.reason = state.probeError || "This browser can't read this file";
+      state.reason = state.probeError || "Browser can't read this file";
       render();
       return;
     }
@@ -133,7 +133,7 @@
         else plan = await server.plan_job({ meta: state.meta, settings: s, device: false });
       }
     } catch {
-      plan = { error: "Couldn't reach the server. Check your connection and try again." };
+      plan = { error: "Can't reach the server. Check your connection." };
     }
     if (seq !== planSeq) return; // a newer change is already being planned
     Object.assign(state, { plan, path: plan.passthrough === 'unchanged' ? 'none' : path, reason });
@@ -182,16 +182,16 @@
     ui.tape.classList.toggle('is-overflow', overflow);
     ui.tape.classList.toggle('is-src-right', !overflow && state.file.size / scaleMax > 0.55);
     ui.strip.style.setProperty('--tm-src', pct(state.file.size));
-    ui.src.textContent = `${overflow ? 'Your file is ' : 'Your file, '}${mb(state.file.size)}`;
+    ui.src.textContent = `Original ${mb(state.file.size)}`;
 
     ui.tape.classList.toggle('is-live', liveBytes != null);
     ui.tape.classList.toggle('is-final', finalBytes != null);
     ui.tape.classList.toggle('is-over', finalBytes != null && finalBytes > target);
     const shown = finalBytes ?? liveBytes ?? (plan && !plan.error ? (plan.passthrough ? state.file.size : plan.est_bytes) : 0);
     ui.strip.style.setProperty('--tm-fill', pct(shown));
-    if (finalBytes != null) ui.tapeNote.textContent = `${mb(finalBytes)} ${finalBytes <= target ? 'fits under' : 'is over'} the ${s.target_mb} MB limit.`;
-    else if (liveBytes != null) ui.tapeNote.textContent = `About ${mb(liveBytes)} so far.`;
-    else if (plan && !plan.error && !plan.passthrough) ui.tapeNote.textContent = `Expected output: about ${mb(plan.est_bytes)}.`;
+    if (finalBytes != null) ui.tapeNote.textContent = `Final size: ${mb(finalBytes)}`;
+    else if (liveBytes != null) ui.tapeNote.textContent = `${mb(liveBytes)} so far`;
+    else if (plan && !plan.error && !plan.passthrough) ui.tapeNote.textContent = `Estimated size: ${mb(plan.est_bytes)}`;
     else ui.tapeNote.textContent = '';
   }
 
@@ -202,34 +202,34 @@
 
     if (!state.file) {
       ui.modeHint.textContent = s.mode === 'quality'
-        ? 'Uploads the clip and compresses it on the server with slower, higher-quality settings.'
-        : 'Compresses on this device when the browser can, and on the server when it can’t.';
+        ? 'Compresses on server. Slower, higher quality.'
+        : 'Compresses on your device if supported, otherwise on server.';
     } else if (s.mode === 'quality') {
-      ui.modeHint.textContent = 'Uploads the clip and compresses it on the server with slower, higher-quality settings.';
+      ui.modeHint.textContent = 'Compresses on server. Slower, higher quality.';
     } else if (state.path === 'device') {
-      ui.modeHint.textContent = 'Compresses on this device. Nothing is uploaded.';
+      ui.modeHint.textContent = 'Compresses on this device only, nothing will be uploaded.';
     } else if (state.path === 'none') {
       ui.modeHint.textContent = '';
     } else {
-      ui.modeHint.textContent = `${state.reason}, so this clip will be uploaded and compressed on the server.`;
+      ui.modeHint.textContent = `${state.reason}. Compresses on server.`;
     }
 
     const lines = [];
     if (plan?.error) {
       lines.push(`<span class="is-warn">${escapeHtml(plan.error)}</span>`);
     } else if (plan?.passthrough === 'unchanged') {
-      lines.push(`It's already under ${s.target_mb} MB, so there's nothing to compress.`);
+      lines.push(`Already under ${s.target_mb} MB, nothing to compress.`);
     } else if (plan?.passthrough === 'remux') {
-      lines.push(`It's already under ${s.target_mb} MB. ${s.remove_audio ? 'The audio track will be removed' : 'It will be repackaged as MP4'} without re-encoding.`);
+      lines.push(`Already under ${s.target_mb} MB. ${s.remove_audio ? 'Removes audio' : 'Repackages as MP4'} without re-encoding.`);
     } else if (plan) {
       const fps = plan.target_fps || Math.round(state.meta.fps || 0);
       lines.push(`Output: ${plan.out_width} × ${plan.out_height}${fps ? ` at ${fps} fps` : ''}, ${Math.round(plan.video_bitrate / 1000).toLocaleString()} kbps video.`);
-      if (plan.low_quality) lines.push('<span class="is-warn">That bitrate is very low for this clip, so expect visible blockiness. A shorter trim or a bigger limit will look better.</span>');
+      if (plan.low_quality) lines.push('<span class="is-warn">Very low bitrate, expect blocky video. Trim the clip or raise the limit.</span>');
       if (s.resolution !== 'Auto' && plan.auto_short && plan.auto_short < (plan.target_short || plan.source_short)) {
-        lines.push(`${plan.auto_short}p would look better at this size.`);
+        lines.push(`Auto would use ${plan.auto_short}p.`);
       }
     } else if (state.file) {
-      lines.push('The server will read the file after it uploads.');
+      lines.push('Details available after upload.');
     }
     ui.summary.innerHTML = lines.join(' ');
     ui.go.disabled = !state.file || state.busy || !!plan?.error;
@@ -264,13 +264,13 @@
     ui.root.dataset.stage = 'chosen';
     ui.source.hidden = false;
     ui.sourceName.textContent = file.name;
-    ui.sourceFacts.textContent = `${mb(file.size)}. Reading the file…`;
+    ui.sourceFacts.textContent = `${mb(file.size)}. Reading…`;
     ui.start.value = '0';
     ui.end.value = '';
     setStatus('');
     if (file.size > props.max_mb * MiB) {
-      ui.sourceFacts.textContent = `${mb(file.size)}. Files over ${props.max_mb} MB can't be compressed here; trim it first.`;
-      state.plan = { error: `The limit is ${props.max_mb} MB per file.` };
+      ui.sourceFacts.textContent = mb(file.size);
+      state.plan = { error: `Too large. Max input is ${props.max_mb} MB.` };
       render();
       return;
     }
@@ -280,11 +280,11 @@
       Object.assign(state, probed);
       const { width, height, fps, duration } = state.meta;
       ui.sourceFacts.textContent = `${mb(file.size)}, ${clock(duration)}, ${width} × ${height}${fps ? ` at ${Math.round(fps)} fps` : ''}${state.meta.has_audio ? '' : ', no audio'}`;
-      ui.end.placeholder = `${duration.toFixed(1)} (end)`;
+      ui.end.placeholder = duration.toFixed(1);
       ui.end.max = ui.start.max = duration.toFixed(1);
     } catch (e) {
       if (state.file !== file) return;
-      state.probeError = "This browser can't read this file";
+      state.probeError = "Browser can't read this file";
       ui.sourceFacts.textContent = `${mb(file.size)}.`;
     }
     await replan();
@@ -309,7 +309,7 @@
     ui.video.src = url;
     ui.download.href = url;
     ui.download.download = file ? file.name : outputName('.mp4');
-    ui.resultLine.textContent = `${mb(bytes)}, ${bytes <= target ? 'fits under' : 'is over'} the ${settings().target_mb} MB limit.${seconds ? ` Took ${clock(seconds)}.` : ''}`;
+    ui.resultLine.textContent = `${bytes <= target ? 'Under' : 'Over'} the ${settings().target_mb} MB limit.${seconds ? ` Took ${clock(seconds)}.` : ''}`;
     ui.share.hidden = !(file && navigator.canShare?.({ files: [file] }));
     ui.result.hidden = false;
     renderTape();
@@ -330,7 +330,7 @@
           else reject(new Error(data.message));
         }
       };
-      worker.onerror = (e) => { worker.terminate(); reject(new Error(e.message || 'The encoder stopped unexpectedly.')); };
+      worker.onerror = (e) => { worker.terminate(); reject(new Error(e.message || 'Encoder crashed.')); };
       worker.postMessage({ file: state.file, plan: state.plan, bitrate });
     });
   }
@@ -346,7 +346,7 @@
       // Hardware encoders don't hit a bitrate exactly; re-encode at a corrected
       // rate if the result lands over the limit (never hand back an oversized file).
       for (let attempt = 0; attempt < 3; attempt++) {
-        const label = attempt ? 'Over the limit, compressing again a little smaller' : 'Compressing on this device';
+        const label = attempt ? 'Over the limit, retrying smaller' : 'Compressing on device';
         const { buffer, mime } = await encodeOnce(bitrate, (p) => {
           setStatus(`${label} (${Math.round(p * 100)}%)`);
           renderTape(p * (plan.passthrough ? state.file.size : plan.est_bytes));
@@ -354,7 +354,7 @@
         if (buffer.byteLength <= target || plan.passthrough) return { buffer, mime };
         bitrate *= Math.max(0.5, (0.93 * target - audioBytes) / (buffer.byteLength - audioBytes));
       }
-      throw new Error('Could not get under the limit on this device.');
+      throw new Error('Couldn\'t get under the limit on this device.');
     } finally {
       lock?.release?.();
     }
@@ -370,11 +370,11 @@
       xhr.open('POST', `${base}gradio_api/upload`);
       xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded / e.total);
       xhr.onload = () => {
-        if (xhr.status === 413) return reject(new Error(`The file is over the ${props.max_mb} MB upload limit.`));
+        if (xhr.status === 413) return reject(new Error(`File is over the ${props.max_mb} MB upload limit.`));
         if (xhr.status !== 200) return reject(new Error(`Upload failed (HTTP ${xhr.status}).`));
         try { resolve(JSON.parse(xhr.responseText)[0]); } catch { reject(new Error('Upload failed.')); }
       };
-      xhr.onerror = () => reject(new Error('Upload failed. Check your connection and try again.'));
+      xhr.onerror = () => reject(new Error('Upload failed. Check your connection.'));
       state.abort = () => { xhr.abort(); reject(new DOMException('Cancelled', 'AbortError')); };
       xhr.send(form);
     });
@@ -390,15 +390,15 @@
     for (;;) {
       if (cancelled) throw new DOMException('Cancelled', 'AbortError');
       const s = await server.job_status({ job_id: started.job_id });
-      if (s.state === 'queued') setStatus(`Waiting for the server (${s.position} in line)`);
+      if (s.state === 'queued') setStatus(`Queued (position ${s.position})`);
       else if (s.state === 'running') {
-        setStatus(`Compressing on the server (${Math.round(s.progress * 100)}%)`);
+        setStatus(`Compressing on server (${Math.round(s.progress * 100)}%)`);
         if (state.plan && !state.plan.error) renderTape(s.progress * state.plan.est_bytes);
       } else if (s.state === 'done') {
         const base = (window.gradio_config?.root || location.href.replace(/[?#].*$/, '')).replace(/\/?$/, '/');
         return { url: base + s.url, size: s.size };
       } else if (s.state === 'cancelled') throw new DOMException('Cancelled', 'AbortError');
-      else throw new Error(s.error || 'The server could not compress this file.');
+      else throw new Error(s.error || 'Server couldn\'t compress this file.');
       await new Promise((r) => setTimeout(r, 800));
     }
   }
@@ -427,9 +427,9 @@
         } catch (e) {
           if (e.name === 'AbortError') throw e;
           // Anything the browser couldn't finish still has the server.
-          setStatus(`${e.message} Trying the server instead…`);
+          setStatus(`${e.message} Retrying on server…`);
           state.path = 'server';
-          state.reason = 'This device couldn\'t finish the encode';
+          state.reason = 'On-device encode failed';
         }
       }
       const { url, size } = await runOnServer();
@@ -478,7 +478,7 @@
   });
   document.addEventListener('visibilitychange', () => {
     if (document.hidden && state.busy && state.path === 'device') {
-      setStatus('Keep this tab open while it compresses. Phones pause background tabs.');
+      setStatus('Keep this tab open until it finishes.');
     }
   });
 

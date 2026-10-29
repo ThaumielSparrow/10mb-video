@@ -174,4 +174,7 @@ if __name__ == "__main__":
         server_name="0.0.0.0", server_port=7860, inbrowser=True,
         max_file_size=f"{MAX_INPUT_MB}mb",
         allowed_paths=[OUTPUT_DIR],
+        footer_links=["gradio"],
+        # Gradio still renders the "·" separators around the links it hides.
+        css="footer .divider { display: none; }",
     )

@@ -1,7 +1,7 @@
 <section class="tm" data-stage="empty">
   <header class="tm-head">
-    <h1>Shrink a video to fit an upload limit</h1>
-    <p>Pick a clip and a size limit. Fast mode compresses on your device, so nothing gets uploaded.</p>
+    <h1>10mb-video</h1>
+    <p>Upload a video and select a size limit.</p>
   </header>
 
   <!-- Kept outside the picker (which hides once a file is chosen) so the
@@ -42,8 +42,8 @@
         <label><input type="radio" name="tm-target" value="custom"><span>Other</span></label>
       </div>
       <label class="tm-custom" hidden>
-        <span>Limit in MB</span>
-        <input type="number" class="tm-custom-mb" min="1" max="2000" step="0.5" value="15" inputmode="decimal">
+        <input type="number" class="tm-custom-mb" min="1" max="2000" step="0.5" value="15" inputmode="decimal" aria-label="Size limit in MB">
+        <span>MB</span>
       </label>
     </fieldset>
 
@@ -78,12 +78,12 @@
           </select>
         </label>
         <label>
-          <span>Start (seconds)</span>
+          <span>Trim start (s)</span>
           <input type="number" class="tm-start" min="0" step="0.1" value="0" inputmode="decimal">
         </label>
         <label>
-          <span>End (seconds)</span>
-          <input type="number" class="tm-end" min="0" step="0.1" placeholder="End of clip" inputmode="decimal">
+          <span>Trim end (s)</span>
+          <input type="number" class="tm-end" min="0" step="0.1" placeholder="End" inputmode="decimal">
         </label>
         <label class="tm-check">
           <input type="checkbox" class="tm-noaudio">
